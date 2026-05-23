@@ -15,6 +15,7 @@ program
   .argument('<path>', 'Path to Java/Spring Boot project to analyze')
   .option('--json', 'Output results as JSON')
   .option('--rule <name>', 'Run only one rule: blocking | layers | kafka | transactions | observability')
+  .option('--ignore <dirs>', 'Comma-separated directories to exclude (e.g. labs,demos,test)')
   .option('--no-color', 'Disable colored output')
   .parse();
 

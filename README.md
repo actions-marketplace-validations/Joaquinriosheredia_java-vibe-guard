@@ -82,9 +82,24 @@ Options:
   -V, --version          show version
   --json                 output results as JSON (for CI parsing)
   --rule <name>          run only one rule: blocking | layers | kafka | transactions | observability
+  --ignore <dirs>        comma-separated directories to exclude from scanning
   --no-color             disable colored output
   -h, --help             display help
 ```
+
+### Excluding directories
+
+Use `--ignore` to skip directories that intentionally deviate from production patterns:
+
+```bash
+# Skip educational lab directories and test fixtures
+java-vibe-guard . --ignore labs,demos,test
+
+# Skip generated code and legacy modules
+java-vibe-guard . --ignore generated,legacy,sandbox
+```
+
+> **Note on educational projects:** `controller→repository` findings in lab or tutorial code are often intentional simplifications — the goal is demonstrating a single concept without the full service layer. Use `--ignore` to suppress findings in those directories and keep CI signal clean for production code only.
 
 ---
 

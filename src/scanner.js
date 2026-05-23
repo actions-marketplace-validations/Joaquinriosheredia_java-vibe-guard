@@ -15,23 +15,23 @@ const RULES = [
   { id: 'observability', fn: checkObservability },
 ];
 
-const IGNORED_DIRS = new Set([
+const DEFAULT_IGNORED_DIRS = new Set([
   'node_modules', '.git', 'target', 'build', '.gradle', '.mvn',
   'out', 'dist', '.idea', '__pycache__', 'benchmark',
 ]);
 
 const SCAN_EXTENSIONS = new Set(['.java', '.yml', '.yaml', '.properties', '.xml', '.gradle', '.kts']);
 
-export function collectFiles(dir, files = []) {
+export function collectFiles(dir, files = [], ignoredDirs = DEFAULT_IGNORED_DIRS) {
   let entries;
   try { entries = readdirSync(dir); } catch { return files; }
   for (const entry of entries) {
-    if (IGNORED_DIRS.has(entry)) continue;
+    if (ignoredDirs.has(entry)) continue;
     const fullPath = join(dir, entry);
     let stat;
     try { stat = statSync(fullPath); } catch { continue; }
     if (stat.isDirectory()) {
-      collectFiles(fullPath, files);
+      collectFiles(fullPath, files, ignoredDirs);
     } else if (SCAN_EXTENSIONS.has(extname(entry))) {
       files.push(fullPath);
     }
@@ -44,12 +44,17 @@ export async function runGuard(projectPath, opts = {}) {
   const only = opts.rule ? opts.rule.toLowerCase() : null;
   const rules = only ? RULES.filter(r => r.id === only) : RULES;
 
+  const ignoredDirs = new Set(DEFAULT_IGNORED_DIRS);
+  if (opts.ignore) {
+    opts.ignore.split(',').map(d => d.trim()).filter(Boolean).forEach(d => ignoredDirs.add(d));
+  }
+
   if (only && rules.length === 0) {
     console.error(`Unknown rule: "${only}". Valid: ${RULES.map(r => r.id).join(', ')}`);
     return 1;
   }
 
-  const files = collectFiles(absPath);
+  const files = collectFiles(absPath, [], ignoredDirs);
   if (files.length === 0) {
     console.error(`No Java/config files found in: ${absPath}`);
     return 1;
