@@ -1,159 +1,123 @@
-# java-vibe-guard
+# java-vibe-guard — Anti-Vibe-Coding Defense Stack
 
-> Stop shipping AI-generated Java code that looks right but fails in production. Get caught in seconds.
+A multi-layer defense system against vibe coding anti-patterns in Java/Spring Boot projects. Combines static analysis, MCP-native tooling, and cognitive governance to catch production bugs that compile cleanly and fail under load.
 
-[![npm version](https://img.shields.io/npm/v/java-vibe-guard?color=blue)](https://www.npmjs.com/package/java-vibe-guard)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Node.js ≥18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
+## Structure
 
----
-
-## The problem
-
-You (or your AI assistant) wrote Spring Boot code that compiles, the tests pass, and it looks clean. Then it goes to production and:
-
-- A `@Scheduled` job blocks all threads with `.get()` on a CompletableFuture
-- A Controller calls a Repository directly, skipping the Service layer
-- A Kafka consumer has no retry strategy — one bad message kills the consumer
-- `@Transactional` + `@Async` silently loses the transaction
-- Every endpoint is a black box with zero structured logging
-
-**java-vibe-guard** scans your project in seconds and tells you exactly what is wrong and how to fix it.
+```
+java-vibe-guard/
+├── cli/          # Node.js static analyzer (npm package)
+└── mcp-server/   # Spring Boot MCP server for Claude Code integration
+```
 
 ---
 
-## Quick start
+## The Problem
+
+Vibe coding produces code that compiles, passes mocked unit tests, and fails in production under real load. LLMs generate syntactically plausible patterns that violate architectural invariants only visible at runtime — blocking calls inside transactions, direct cross-layer access, missing observability. No single tool catches all of them because they operate at different points in the development cycle.
+
+---
+
+## The Three Layers
+
+### Layer 1 — senior-architect (CLAUDE.md global gate)
+
+**When it acts:** before Claude writes a single line of code.
+
+**Mechanism:** mandatory rule in `~/.claude/CLAUDE.md` that forces Claude to internally run the `ai-risk-constraints.md` protocol before any relevant change. The protocol runs five checks (blast radius, reversibility, dependencies, architecture, security) and emits an explicit decision: `APPROVE / REJECT / APPROVE WITH RISKS`. If `REJECT`, Claude explains what fails and what is needed to approve it. If the gate doesn't pass, the code isn't written.
+
+**What it eliminates:** incorrect architectural decisions that no linter can see. Examples: introducing persistence where it shouldn't exist, adding a dependency that creates unnecessary coupling, generating code with shared state between requests in a stateless context, changing business logic without understanding the existing contract. It's the only point in the stack that can stop a change before it exists.
+
+**Limitation:** operates on declared intent, not written code. Cannot detect implementation errors arising from the gap between what the LLM said it would do and what it actually generated.
+
+---
+
+### Layer 2 — java-vibe-guard CLI (`cli/`)
+
+**When it acts:** after code exists, before or after commit, integrable into CI.
+
+**Mechanism:** Node.js tool that recursively scans a Java/Spring Boot project applying static analysis rules based on regex patterns and context heuristics. Current rules detect: blocking calls in async annotations (`@Async`, `@KafkaListener`), direct Controller→Repository or Controller→Kafka access (layer violation), endpoints without structured logging. Each finding includes file, line, severity, and explanation of why it's a production anti-pattern.
+
+**What it eliminates:** the gap between what the LLM declares and what it generates. An LLM can pass the architecture gate saying "I'll handle this asynchronously" and then generate a blocking `.get()` in the same method. The CLI detects it independently of intent. Also works as an audit tool on pre-existing or legacy code.
+
+**Limitation:** textual analysis, not full AST. Doesn't understand real control flow or object types. Can produce false positives with coincidental naming, and cannot reason about anti-patterns that only emerge from the composition of multiple methods.
 
 ```bash
-# No install needed
-npx java-vibe-guard ./my-spring-project
-
-# Or install globally
-npm install -g java-vibe-guard
-java-vibe-guard ./my-spring-project
+cd cli
+npx java-vibe-guard ./path/to/project
+npx java-vibe-guard ./path/to/project --ignore target,build
 ```
 
 ---
 
-## What it detects
+### Layer 3 — java-vibe-guard MCP Server (`mcp-server/`)
 
-| Rule | Severity | Pattern |
-|------|----------|---------|
-| **blocking** | 🔴 CRITICAL | `.get()` / `.join()` / `.block()` / `Thread.sleep()` inside `@Scheduled`, `@KafkaListener`, `@Async` |
-| **layers** | 🟡 MAJOR | `@Controller` accessing `*Repository` or `KafkaTemplate` directly |
-| **transactions** | 🟡 MAJOR | `@Transactional` on Controller · `@Transactional` + `@Async` combination |
-| **kafka** | ⚠️ WARNING | Zookeeper in docker-compose · `@KafkaListener` without `groupId` · no `@RetryableTopic` or DLQ |
-| **observability** | ⚠️ WARNING | Endpoint methods with no structured logging (`log.info`, `log.warn`, etc.) |
+**When it acts:** during active Claude Code workflow, as a tool available in context.
 
----
+**Mechanism:** MCP (Model Context Protocol) server implemented in Spring Boot that exposes `analyzeProject` as a native Claude Code tool. When Claude generates code for a project, it can invoke the analysis directly as part of its reasoning — before declaring the task complete, after a refactor, or when the user requests it. The result (files analyzed, issues by severity, exact line and diagnostic message) enters Claude's context and can inform the next action.
 
-## Example output
+**What it adds over the CLI:** closes the feedback loop within the same session. Instead of manually running the CLI and pasting the output, Claude can analyze, see the results, fix, and re-analyze in a single conversation. Also serves as a validation signal Claude can use to confirm that a change it just made didn't introduce new anti-patterns.
 
-```
-java-vibe-guard — vibe coding detector for Java/Spring Boot
-Scanning: ./my-project  (47 files)
-
-❌ CRITICAL: blocking .get() detected in @Scheduled method → OutboxPublisher.java:55
-❌ CRITICAL: @Transactional + @Async — transaction will NOT propagate to async thread → PaymentService.java:88
-❌ MAJOR: Controller accessing Repository directly (UserRepository) → UserController.java:23
-❌ MAJOR: @Transactional on Controller method (move to Service layer) → PaymentController.java:12
-⚠️  WARNING: @KafkaListener without @RetryableTopic or DLQ → OrderConsumer.java:34
-⚠️  WARNING: Kafka using Zookeeper (deprecated — migrate to KRaft) → docker-compose.yml:8
-⚠️  WARNING: Endpoint without structured logging → OrderController.java:67
-
-──────────────────────────────────────────────────────────────
-📊 Summary: 2 critical · 2 major · 3 warnings
-──────────────────────────────────────────────────────────────
-
-🚨 2 CRITICAL issue(s) found — fix before deploying to production.
-```
-
----
-
-## CLI options
-
-```
-Usage: java-vibe-guard <path> [options]
-
-Arguments:
-  path                   Path to Java/Spring Boot project to analyze
-
-Options:
-  -V, --version          show version
-  --json                 output results as JSON (for CI parsing)
-  --rule <name>          run only one rule: blocking | layers | kafka | transactions | observability
-  --ignore <dirs>        comma-separated directories to exclude from scanning
-  --no-color             disable colored output
-  -h, --help             display help
-```
-
-### Excluding directories
-
-Use `--ignore` to skip directories that intentionally deviate from production patterns:
+**Limitation:** same as the CLI, inheriting its static analysis constraints. Also depends on Claude deciding to invoke the tool — it is not an automatic barrier like the senior-architect gate.
 
 ```bash
-# Skip educational lab directories and test fixtures
-java-vibe-guard . --ignore labs,demos,test
+# Build
+cd mcp-server
+mvn package -DskipTests
 
-# Skip generated code and legacy modules
-java-vibe-guard . --ignore generated,legacy,sandbox
-```
-
-> **Note on educational projects:** `controller→repository` findings in lab or tutorial code are often intentional simplifications — the goal is demonstrating a single concept without the full service layer. Use `--ignore` to suppress findings in those directories and keep CI signal clean for production code only.
-
----
-
-## CI integration
-
-Exit code `1` if any CRITICAL finding, `0` otherwise.
-
-```yaml
-# GitHub Actions
-- name: Vibe guard check
-  run: npx java-vibe-guard . --json | tee vibe-report.json
-  # Fails the build on CRITICAL findings
+# Register in Claude Code (user scope — available in all projects)
+claude mcp add java-vibe-guard -s user -- java -jar mcp-server/target/java-vibe-guard-mcp-1.0.0-SNAPSHOT.jar
 ```
 
 ---
 
-## Run a single rule
+## How They Act as a Pipeline
 
-```bash
-java-vibe-guard ./project --rule blocking
-java-vibe-guard ./project --rule kafka
-java-vibe-guard ./project --rule layers
-java-vibe-guard ./project --rule transactions
-java-vibe-guard ./project --rule observability
+```
+[User request]
+       │
+       ▼
+┌─────────────────────────────┐
+│   LAYER 1: senior-architect │  ← "Should this be done?"
+│   Pre-code cognitive gate   │     APPROVE / REJECT
+└──────────────┬──────────────┘
+               │ APPROVE
+               ▼
+┌─────────────────────────────┐
+│   Claude generates code     │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│   LAYER 3: MCP server       │  ← "Is the generated code safe?"
+│   In-session feedback loop  │     Analyze → fix → re-analyze
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│   LAYER 2: CLI in CI        │  ← "Is the full repo clean?"
+│   Pre-merge gate            │     Blocks on unresolved findings
+└─────────────────────────────┘
 ```
 
----
-
-## Why these rules?
-
-### blocking — Thread starvation in production
-A `CompletableFuture.get()` inside a `@Scheduled` method blocks the scheduler thread. Under load, all scheduler threads exhaust and no scheduled task runs again. This is one of the most common silent failures in AI-generated Spring Boot code.
-
-### layers — Architectural corruption
-Controllers calling Repositories directly bypass all business logic, validation, caching, and event publishing in the Service layer. One sprint of vibe coding and your architecture is gone.
-
-### transactions — The silent rollback trap
-`@Transactional` on a Controller means the transaction spans the entire HTTP request including serialization — holding database connections longer than necessary. `@Transactional` + `@Async` is worse: Spring creates a new thread for `@Async`, which has no transaction context. The code runs, nothing fails, and your data is silently inconsistent.
-
-### kafka — At-least-once with zero guarantees
-A Kafka consumer without `groupId` creates a random group on every restart — it will reprocess all messages from the beginning. Without `@RetryableTopic`, one poison pill message retries forever and blocks partition progress.
-
-### observability — Black box endpoints
-Without structured logging at endpoints, debugging production incidents requires re-deployment. One `log.info` with the correlation ID costs nothing. The absence costs hours.
+The three layers are deliberately redundant in purpose but not in mechanism. The redundancy is correct because each layer has a different failure vector: the cognitive gate can approve incorrect code, the MCP may not be invoked, the CLI may have false negatives. None fail simultaneously against the same type of error.
 
 ---
 
-## Requirements
+## What They Eliminate Together
 
-- Node.js 18+
-- A Java/Spring Boot project to scan
+| Anti-pattern | Layer that catches it |
+|---|---|
+| Incorrect architectural decision ("add persistence here") | Layer 1 |
+| `.get()` blocking inside `@Transactional` or `@KafkaListener` | Layers 2 + 3 |
+| Controller accessing repository directly | Layers 2 + 3 |
+| Endpoint without structured logging | Layers 2 + 3 |
+| Generated code the LLM declares correct but isn't | Layer 3 (immediate feedback) |
+| Regression introduced by refactoring | Layer 3 (post-change re-analysis) |
+| Technical debt in untouched legacy code | Layer 2 (CI audit) |
 
 ---
 
-## License
+## Stack Evaluation
 
-MIT
+What makes it solid is not the sophistication of any individual layer, but that the pipeline operates at zero marginal cost per analysis: the cognitive gate is part of Claude's process, the MCP is a tool call within the session, the CLI is executable in any CI without licenses. The total system cost is zero. The only real cost is not having it: production code with anti-patterns that only fail under load.
