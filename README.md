@@ -12,6 +12,24 @@ java-vibe-guard/
 
 ---
 
+## Active Rules — MCP Server (VIBE-001 to VIBE-007)
+
+**7 rules · 102 tests · 0 false positives**
+
+| Code | Rule | Description |
+|------|------|-------------|
+| VIBE-001 | `TransactionalAsyncRule` | `.get()` / `.block()` inside `@Transactional` exhausts the DB connection pool |
+| VIBE-002 | `ReactorBlockingCallRule` | `.block()` / `.blockFirst()` / `.toFuture().get()` in reactive `@RestController` or `@Service` |
+| VIBE-003 | `JpaNPlusOneRule` | Single-entity repository call (`findById`, `save`, `delete`) inside a loop or stream lambda |
+| VIBE-004 | `VirtualThreadsMisuseRule` | `synchronized` or `ThreadLocal` in Virtual Threads context pins the carrier platform thread |
+| VIBE-005 | `ConnectionPoolStarvationRule` | Blocking external call (HTTP, sleep, file I/O, `Future.get()`) inside `@Transactional` |
+| VIBE-006 | `KafkaRebalanceHazardRule` | `@KafkaListener` without explicit `groupId`, or blocking call inside listener thread |
+| VIBE-007 | `MdcContextLeakRule` | `MDC.put()` in `@Async` / `@Scheduled` without `MDC.clear()` leaks context across thread reuse |
+
+All rules share the same design principles: explicit annotation gate (no inference), `codeOnly()` stripping to prevent matches in comments and string literals, and precision over coverage — when in doubt, the rule does not flag.
+
+---
+
 ## The Problem
 
 Vibe coding produces code that compiles, passes mocked unit tests, and fails in production under real load. LLMs generate syntactically plausible patterns that violate architectural invariants only visible at runtime — blocking calls inside transactions, direct cross-layer access, missing observability. No single tool catches all of them because they operate at different points in the development cycle.
