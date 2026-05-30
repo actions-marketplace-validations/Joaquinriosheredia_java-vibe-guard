@@ -1,0 +1,138 @@
+name: 'java-vibe-guard'
+description: 'Detect vibe coding anti-patterns in Java/Spring Boot projects before they reach production'
+author: 'Joaquin Rios Heredia'
+
+branding:
+  icon: 'shield'
+  color: 'red'
+
+# ─── Inputs ───────────────────────────────────────────────────────────────────
+
+inputs:
+  path:
+    description: 'Path to the Java/Spring Boot project to scan (relative to workspace root)'
+    required: false
+    default: '.'
+
+  rule:
+    description: 'Run only one rule: blocking | layers | kafka | transactions | observability'
+    required: false
+    default: ''
+
+  ignore:
+    description: 'Comma-separated directory names to exclude (e.g. labs,demos,legacy)'
+    required: false
+    default: ''
+
+  fail-on:
+    description: 'Fail the step when: critical (default) | never'
+    required: false
+    default: 'critical'
+
+  upload-report:
+    description: 'Upload the JSON report as a workflow artifact'
+    required: false
+    default: 'true'
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+
+outputs:
+  critical:
+    description: 'Number of CRITICAL issues found'
+    value: ${{ steps.scan.outputs.critical }}
+
+  major:
+    description: 'Number of MAJOR issues found'
+    value: ${{ steps.scan.outputs.major }}
+
+  warning:
+    description: 'Number of WARNING issues found'
+    value: ${{ steps.scan.outputs.warning }}
+
+  healthy:
+    description: '"true" when no CRITICAL issues were found'
+    value: ${{ steps.scan.outputs.healthy }}
+
+  report-json:
+    description: 'Absolute path to the JSON report file on the runner'
+    value: ${{ steps.scan.outputs.report-json }}
+
+# ─── Steps ────────────────────────────────────────────────────────────────────
+
+runs:
+  using: composite
+  steps:
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install CLI dependencies
+      shell: bash
+      run: npm ci --prefix "${{ github.action_path }}/cli"
+
+    - name: Scan
+      id: scan
+      shell: bash
+      env:
+        VG_PATH:    ${{ inputs.path }}
+        VG_RULE:    ${{ inputs.rule }}
+        VG_IGNORE:  ${{ inputs.ignore }}
+        VG_FAIL_ON: ${{ inputs.fail-on }}
+        CLI:        ${{ github.action_path }}/cli/bin/cli.js
+      run: |
+        REPORT="$RUNNER_TEMP/vibe-guard-report.json"
+
+        # Build arg array — avoids quoting pitfalls with env vars
+        ARGS=("$VG_PATH" "--json")
+        [[ -n "$VG_RULE"   ]] && ARGS+=("--rule"   "$VG_RULE")
+        [[ -n "$VG_IGNORE" ]] && ARGS+=("--ignore" "$VG_IGNORE")
+
+        # Run CLI: stream JSON to log via tee, save to file for parsing
+        node "$CLI" "${ARGS[@]}" | tee "$REPORT"
+        SCAN_EXIT=${PIPESTATUS[0]}
+
+        # Extract per-severity counts and healthy flag from stable JSON contract
+        CRITICAL=$(jq '.summary.critical' "$REPORT")
+        MAJOR=$(jq    '.summary.major'    "$REPORT")
+        WARNING=$(jq  '.summary.warning'  "$REPORT")
+        HEALTHY=$(jq  -r '.healthy'       "$REPORT")
+
+        # Expose outputs to subsequent steps / caller workflows
+        echo "critical=$CRITICAL"  >> "$GITHUB_OUTPUT"
+        echo "major=$MAJOR"        >> "$GITHUB_OUTPUT"
+        echo "warning=$WARNING"    >> "$GITHUB_OUTPUT"
+        echo "healthy=$HEALTHY"    >> "$GITHUB_OUTPUT"
+        echo "report-json=$REPORT" >> "$GITHUB_OUTPUT"
+
+        # Write a markdown summary visible in the Actions UI
+        {
+          echo "## java-vibe-guard"
+          echo ""
+          if [[ "$HEALTHY" == "true" ]]; then
+            echo "✅ **No CRITICAL issues** — production-ready"
+          else
+            echo "🚨 **$CRITICAL CRITICAL issue(s)** — must fix before deploying"
+          fi
+          echo ""
+          echo "| Severity | Count |"
+          echo "|----------|------:|"
+          echo "| 🔴 CRITICAL | $CRITICAL |"
+          echo "| 🟡 MAJOR    | $MAJOR |"
+          echo "| ⚠️ WARNING  | $WARNING |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # Apply fail-on policy
+        if [[ "$VG_FAIL_ON" == "critical" && $SCAN_EXIT -eq 1 ]]; then
+          echo "::error::java-vibe-guard: $CRITICAL CRITICAL issue(s) found — fix before merging"
+          exit 1
+        fi
+
+    - name: Upload report artifact
+      if: ${{ always() && inputs.upload-report == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: vibe-guard-report
+        path: ${{ steps.scan.outputs.report-json }}
+        retention-days: 30

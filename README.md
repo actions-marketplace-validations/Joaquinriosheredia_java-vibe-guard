@@ -54,6 +54,39 @@ npx java-vibe-guard ./path/to/project
 npx java-vibe-guard ./path/to/project --ignore target,build
 ```
 
+#### GitHub Action
+
+Add to any Java project's workflow — no installation required:
+
+```yaml
+- name: java-vibe-guard
+  uses: Joaquinriosheredia/java-vibe-guard@v1
+  with:
+    path: '.'            # directory to scan (default: .)
+    fail-on: 'critical'  # fail step on CRITICAL findings (default)
+```
+
+Full options:
+
+```yaml
+- uses: Joaquinriosheredia/java-vibe-guard@v1
+  with:
+    path: '.'
+    rule: ''             # blank = all rules; or: blocking | layers | kafka | transactions | observability
+    ignore: 'labs,demo'  # comma-separated dirs to skip
+    fail-on: 'critical'  # critical | never
+    upload-report: 'true'  # attach JSON report as artifact
+
+  # Outputs available in subsequent steps:
+  #   ${{ steps.guard.outputs.critical }}
+  #   ${{ steps.guard.outputs.major }}
+  #   ${{ steps.guard.outputs.warning }}
+  #   ${{ steps.guard.outputs.healthy }}
+  #   ${{ steps.guard.outputs.report-json }}
+```
+
+The action writes a markdown table to the GitHub Actions summary panel and uploads the full JSON report as a workflow artifact (30-day retention).
+
 ---
 
 ### Layer 3 — java-vibe-guard MCP Server (`mcp-server/`)
