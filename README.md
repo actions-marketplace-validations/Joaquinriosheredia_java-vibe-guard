@@ -1,6 +1,31 @@
 # java-vibe-guard — Anti-Vibe-Coding Defense Stack
 
+[![GitHub Action](https://img.shields.io/badge/GitHub_Action-available-blue?logo=github-actions)](https://github.com/Joaquinriosheredia/java-vibe-guard/actions)
+
 A multi-layer defense system against vibe coding anti-patterns in Java/Spring Boot projects. Combines static analysis, MCP-native tooling, and cognitive governance to catch production bugs that compile cleanly and fail under load.
+
+## Quick Start
+
+### CLI
+```bash
+npx java-vibe-guard ./your-spring-project
+```
+
+### GitHub Actions (CI)
+```yaml
+- uses: Joaquinriosheredia/java-vibe-guard@v1
+  with:
+    path: '.'
+    fail-on: 'critical'
+```
+
+Fails the build on CRITICAL findings. Zero configuration required.
+
+### MCP Server (Claude Code)
+1. Download java-vibe-guard-mcp-0.1.0.jar from releases
+2. `claude mcp add java-vibe-guard -s user -- java -jar /path/to/java-vibe-guard-mcp-0.1.0.jar`
+
+Requires Java 21+
 
 ## Structure
 
