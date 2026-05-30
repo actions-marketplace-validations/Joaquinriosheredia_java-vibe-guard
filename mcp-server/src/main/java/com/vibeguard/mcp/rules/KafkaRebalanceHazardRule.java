@@ -12,10 +12,12 @@ import java.util.regex.Pattern;
  * Detects patterns that cause consumer lag, unnecessary rebalances, and
  * throughput degradation in Spring Kafka listeners.
  *
- * Two signal classes:
- *   CRITICAL — @KafkaListener without an explicit, non-empty groupId:
- *              each restart joins a random consumer group, causing rebalances
- *              and potential duplicate or lost message processing.
+ * Three signal classes:
+ *   WARNING  — @KafkaListener without groupId in annotation:
+ *              may be configured via application.yml or env vars; if not,
+ *              each restart joins a random consumer group causing rebalances.
+ *   CRITICAL — @KafkaListener with groupId explicitly set to "":
+ *              empty string is never a valid consumer group, guaranteed rebalance.
  *   CRITICAL — Blocking call inside @KafkaListener method body:
  *              the listener thread stalls, max.poll.interval.ms can expire,
  *              Kafka considers the consumer dead and triggers a rebalance.
@@ -55,6 +57,10 @@ public class KafkaRebalanceHazardRule implements Rule {
     private static final Pattern GROUP_ID_VALID =
         Pattern.compile("groupId\\s*=\\s*\"[^\"]+\"");
 
+    // groupId explicitly set to empty string "" — always CRITICAL (invalid group name).
+    private static final Pattern GROUP_ID_EXPLICIT_EMPTY =
+        Pattern.compile("groupId\\s*=\\s*\"\"");
+
     // Blocking calls that stall the listener thread beyond max.poll.interval.ms.
     // Same detection surface as ConnectionPoolStarvationRule — any call that blocks
     // the calling thread for an unpredictable duration is a rebalance risk here.
@@ -86,20 +92,22 @@ public class KafkaRebalanceHazardRule implements Rule {
         int braceDepth = 0;
 
         // Annotation accumulation state (outside methods)
-        boolean       pendingExcluded      = false;
-        boolean       pendingKafkaListener = false;
-        boolean       pendingGroupIdValid  = false;
-        int           kafkaParenDepth      = 0;
-        StringBuilder kafkaAnnotBuf        = null;
+        boolean       pendingExcluded           = false;
+        boolean       pendingKafkaListener      = false;
+        boolean       pendingGroupIdValid        = false;
+        boolean       pendingGroupIdExplicitEmpty = false;
+        int           kafkaParenDepth            = 0;
+        StringBuilder kafkaAnnotBuf              = null;
 
         // Method state
-        boolean inMethod              = false;
-        boolean inExcludedMethod      = false;
-        boolean inKafkaListenerMethod = false;
-        boolean listenerGroupIdValid  = false;
-        boolean emittedGroupIdIssue   = false;
-        int     methodDepth           = -1;
-        int     methodLine            = -1;
+        boolean inMethod                    = false;
+        boolean inExcludedMethod            = false;
+        boolean inKafkaListenerMethod       = false;
+        boolean listenerGroupIdValid        = false;
+        boolean listenerGroupIdExplicitEmpty = false;
+        boolean emittedGroupIdIssue         = false;
+        int     methodDepth                 = -1;
+        int     methodLine                  = -1;
 
         for (int i = 0; i < lines.size(); i++) {
             String line = lines.get(i);
@@ -124,7 +132,9 @@ public class KafkaRebalanceHazardRule implements Rule {
                     }
                     if (kafkaParenDepth == 0) {
                         // Single-line or no-paren annotation — accumulation complete
-                        pendingGroupIdValid = GROUP_ID_VALID.matcher(kafkaAnnotBuf).find();
+                        pendingGroupIdValid         = GROUP_ID_VALID.matcher(kafkaAnnotBuf).find();
+                        pendingGroupIdExplicitEmpty = !pendingGroupIdValid
+                            && GROUP_ID_EXPLICIT_EMPTY.matcher(kafkaAnnotBuf).find();
                     }
                 } else if (pendingKafkaListener && kafkaParenDepth > 0) {
                     // Continuation line of a multi-line @KafkaListener(...) annotation
@@ -134,7 +144,9 @@ public class KafkaRebalanceHazardRule implements Rule {
                         else if (c == ')' && kafkaParenDepth > 0) kafkaParenDepth--;
                     }
                     if (kafkaParenDepth == 0) {
-                        pendingGroupIdValid = GROUP_ID_VALID.matcher(kafkaAnnotBuf).find();
+                        pendingGroupIdValid         = GROUP_ID_VALID.matcher(kafkaAnnotBuf).find();
+                        pendingGroupIdExplicitEmpty = !pendingGroupIdValid
+                            && GROUP_ID_EXPLICIT_EMPTY.matcher(kafkaAnnotBuf).find();
                     }
                 }
             }
@@ -143,19 +155,21 @@ public class KafkaRebalanceHazardRule implements Rule {
             if (!inMethod && METHOD_OPEN.matcher(code).find()) {
                 boolean isAbstract = !code.contains("{") && code.endsWith(";");
                 if (!isAbstract) {
-                    inMethod              = true;
-                    inExcludedMethod      = pendingExcluded || MAIN_METHOD.matcher(code).find();
-                    inKafkaListenerMethod = pendingKafkaListener;
-                    listenerGroupIdValid  = pendingGroupIdValid;
-                    emittedGroupIdIssue   = false;
-                    methodDepth           = braceDepth;
-                    methodLine            = i + 1;
+                    inMethod                     = true;
+                    inExcludedMethod             = pendingExcluded || MAIN_METHOD.matcher(code).find();
+                    inKafkaListenerMethod        = pendingKafkaListener;
+                    listenerGroupIdValid         = pendingGroupIdValid;
+                    listenerGroupIdExplicitEmpty = pendingGroupIdExplicitEmpty;
+                    emittedGroupIdIssue          = false;
+                    methodDepth                  = braceDepth;
+                    methodLine                   = i + 1;
                 }
-                pendingExcluded      = false;
-                pendingKafkaListener = false;
-                pendingGroupIdValid  = false;
-                kafkaAnnotBuf        = null;
-                kafkaParenDepth      = 0;
+                pendingExcluded           = false;
+                pendingKafkaListener      = false;
+                pendingGroupIdValid        = false;
+                pendingGroupIdExplicitEmpty = false;
+                kafkaAnnotBuf             = null;
+                kafkaParenDepth           = 0;
             }
 
             // --- Brace counting ---
@@ -166,28 +180,39 @@ public class KafkaRebalanceHazardRule implements Rule {
 
             // --- Exit: method ---
             if (inMethod && braceDepth <= methodDepth && trim.contains("}")) {
-                inMethod              = false;
-                inExcludedMethod      = false;
-                inKafkaListenerMethod = false;
-                listenerGroupIdValid  = false;
-                emittedGroupIdIssue   = false;
-                methodDepth           = -1;
-                methodLine            = -1;
+                inMethod                     = false;
+                inExcludedMethod             = false;
+                inKafkaListenerMethod        = false;
+                listenerGroupIdValid         = false;
+                listenerGroupIdExplicitEmpty = false;
+                emittedGroupIdIssue          = false;
+                methodDepth                  = -1;
+                methodLine                   = -1;
             }
 
             // Only scan inside active, non-excluded @KafkaListener methods
             if (!inMethod || inExcludedMethod || !inKafkaListenerMethod) continue;
 
-            // --- CRITICAL: missing or empty groupId ---
+            // --- CRITICAL/WARNING: missing or empty groupId ---
             // Emitted once per method on the method declaration line so the developer
             // sees the annotation that needs to be fixed, not a line inside the body.
             if (!listenerGroupIdValid && !emittedGroupIdIssue) {
-                issues.add(new Issue(id(), "CRITICAL", file.path(), methodLine,
-                    "Kafka rebalance hazard: @KafkaListener without explicit groupId — " +
-                    "each restart joins a new random consumer group, causing rebalances " +
-                    "and potential duplicate or lost message processing; " +
-                    "add groupId = \"your-consumer-group\""
-                ));
+                if (listenerGroupIdExplicitEmpty) {
+                    issues.add(new Issue(id(), "CRITICAL", file.path(), methodLine,
+                        "Kafka rebalance hazard: @KafkaListener without explicit groupId — " +
+                        "each restart joins a new random consumer group, causing rebalances " +
+                        "and potential duplicate or lost message processing; " +
+                        "add groupId = \"your-consumer-group\""
+                    ));
+                } else {
+                    issues.add(new Issue(id(), "WARNING", file.path(), methodLine,
+                        "groupId not found in @KafkaListener annotation. " +
+                        "Verify it is configured via application.yml, " +
+                        "application-*.yml or environment variables. " +
+                        "If not configured elsewhere, consumer reprocessing " +
+                        "may occur after restarts."
+                    ));
+                }
                 emittedGroupIdIssue = true;
             }
 

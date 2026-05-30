@@ -25,13 +25,17 @@ class KafkaRebalanceHazardRuleTest {
         List<Issue> issues = rule.analyze(FileContent.of("KafkaRebalanceHazardTruePositive.java", code));
 
         assertThat(issues)
-            .as("Expected multiple CRITICAL issues in the true-positive fixture")
+            .as("Expected multiple issues in the true-positive fixture")
             .isNotEmpty();
 
         assertThat(issues).allSatisfy(issue -> {
             assertThat(issue.ruleId()).isEqualTo("VIBE-006");
-            assertThat(issue.severity()).isEqualTo("CRITICAL");
+            assertThat(issue.severity()).isIn("CRITICAL", "WARNING");
         });
+        assertThat(issues).anyMatch(i -> i.severity().equals("WARNING"))
+            .as("Missing-groupId listeners must produce at least one WARNING");
+        assertThat(issues).anyMatch(i -> i.severity().equals("CRITICAL"))
+            .as("Blocking calls and empty groupId must produce at least one CRITICAL");
     }
 
     @Test
@@ -49,7 +53,7 @@ class KafkaRebalanceHazardRuleTest {
     // -------------------------------------------------------------------------
 
     @Test
-    void listenerWithoutGroupIdIsCritical() {
+    void listenerWithoutGroupIdIsWarning() {
         String code = """
             package com.example;
             import org.springframework.kafka.annotation.KafkaListener;
@@ -63,9 +67,9 @@ class KafkaRebalanceHazardRuleTest {
             """;
         List<Issue> issues = rule.analyze(FileContent.of("Svc.java", code));
         assertThat(issues).hasSize(1);
-        assertThat(issues.getFirst().severity()).isEqualTo("CRITICAL");
+        assertThat(issues.getFirst().severity()).isEqualTo("WARNING");
         assertThat(issues.getFirst().ruleId()).isEqualTo("VIBE-006");
-        assertThat(issues.getFirst().message()).contains("groupId");
+        assertThat(issues.getFirst().message()).contains("groupId not found in @KafkaListener annotation");
     }
 
     @Test
@@ -88,7 +92,7 @@ class KafkaRebalanceHazardRuleTest {
     }
 
     @Test
-    void multiLineListenerWithoutGroupIdIsCritical() {
+    void multiLineListenerWithoutGroupIdIsWarning() {
         String code = """
             package com.example;
             import org.springframework.kafka.annotation.KafkaListener;
@@ -105,7 +109,7 @@ class KafkaRebalanceHazardRuleTest {
             """;
         List<Issue> issues = rule.analyze(FileContent.of("Svc.java", code));
         assertThat(issues).hasSize(1);
-        assertThat(issues.getFirst().severity()).isEqualTo("CRITICAL");
+        assertThat(issues.getFirst().severity()).isEqualTo("WARNING");
     }
 
     @Test
@@ -225,9 +229,10 @@ class KafkaRebalanceHazardRuleTest {
             }
             """;
         List<Issue> issues = rule.analyze(FileContent.of("Svc.java", code));
-        // one CRITICAL for missing groupId + one CRITICAL for Thread.sleep
+        // one WARNING for missing groupId + one CRITICAL for Thread.sleep
         assertThat(issues).hasSize(2);
-        assertThat(issues).allMatch(i -> i.severity().equals("CRITICAL"));
+        assertThat(issues).anyMatch(i -> i.severity().equals("WARNING") && i.message().contains("groupId not found"));
+        assertThat(issues).anyMatch(i -> i.severity().equals("CRITICAL") && i.message().contains("blocking call"));
     }
 
     // -------------------------------------------------------------------------
