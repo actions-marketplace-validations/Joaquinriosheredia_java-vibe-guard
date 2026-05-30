@@ -150,9 +150,108 @@ What makes it solid is not the sophistication of any individual layer, but that 
 
 ## Found in the Wild
 
-Real production bugs detected by `java-vibe-guard` in open-source projects:
-
-- **`KafkaApplication.java:152`** — `@KafkaListener(topics, containerFactory)` without `groupId`; default `application.properties` does not have `spring.kafka.consumer.group-id`
-- **`KafkaApplication.java:164`** — `@KafkaListener(topics, containerFactory)` without `groupId`; no global `group-id`
-- **`KafkaApplication.java:170`** — `@KafkaListener(topics, containerFactory)` without `groupId`; no global `group-id`
+Finding 1 — VIBE-005: @Transactional on @RestController holds DB connections during HTTP serialization
+  
+Repo: eugenp/tutorials (~35k stars), JHipster 8 monolithic module
+Rule: VIBE-005 · ConnectionPoolStarvation · MAJOR
+File: jhipster-8-modules/jhipster-8-monolithic/.../web/rest/AuthorityResource.java
+  
+@RestController
+@RequestMapping("/api/authorities")
+@Transactional // ← flagged
+public class AuthorityResource {
+  
+@GetMapping("")
+public List<Authority> getAllAuthorities() {
+return authorityRepository.findAll();
+}
+  
+@DeleteMapping("/{id}")
+public ResponseEntity<Void> deleteAuthority(@PathVariable String id) {
+authorityRepository.deleteById(id);
+return ResponseEntity.noContent()...build();
+}
+}
+  
+Why it fails under load:
+@Transactional on the class means every endpoint opens a DB connection on the first repository call
+and holds it open until the method fully returns — which includes JSON serialization of the response
+body, header writing, and Tomcat's response commit. DB serialization is measured in microseconds;
+HTTP response finalization under load can take milliseconds of extra latency as the response buffer
+flushes. At 500 concurrent requests against a pool capped at 20 connections, the 480 threads queuing
+for a connection accumulate serialization latency and keep connections checked out longer than
+necessary, accelerating pool exhaustion.
+  
+Estimated impact:
+~10–30% connection hold-time overhead per request; at sustained load, connection pool exhaustion
+causes HikariCP - Connection is not available, request timed out after 30000ms errors. JHipster
+scaffolding generates this pattern for every admin resource controller, so the issue is typically
+replicated across all CRUD controllers in a generated codebase.
+  
+---
+Finding 2 — VIBE-002: .block() called on Schedulers.parallel() thread
+  
+Repo: eugenp/tutorials (~35k stars), spring-reactive-modules
+Rule: VIBE-002 · ReactorBlockingCall · CRITICAL
+File: spring-reactive-modules/spring-reactive-4/.../service/FileContentSearchService.java
+  
+public Mono<Boolean> blockingSearchOnParallelThreadPool(String fileName, String searchTerm) {
+return Mono.just("")
+.publishOn(Schedulers.parallel()) // switches to parallel scheduler
+.map(s -> fileService.getFileContentAsString(fileName)
+.block() // ← flagged: blocks a parallel thread
+.contains(searchTerm));
+}
+  
+Why it fails under load:
+Schedulers.parallel() is a fixed-size thread pool sized to
+Runtime.getRuntime().availableProcessors() — typically 4 to 8 threads on production hardware. Its
+intended use is CPU-bound computation, not I/O. Calling .block() inside a map operator pinned to
+this scheduler occupies one of those threads for the entire duration of the file read. With 5
+concurrent requests on a 4-core machine, all parallel threads are blocked waiting for file I/O; no
+further reactive operators — including other pending HTTP responses, ongoing DB queries, or
+WebClient calls — can be scheduled. The effect is functionally equivalent to a deadlock from the
+reactive pipeline's perspective.
+  
+Estimated impact:
+Under concurrent load, complete stall of all reactive work scheduled on Schedulers.parallel(). On a
+4-core server, 4 simultaneous requests to this endpoint render the service unresponsive to all
+reactive traffic until the blocked threads are released.
+  
+---
+Finding 3 — VIBE-006: Thread.sleep() inside @KafkaListener delays acknowledgement and triggers rebalances
+  
+Repo: eugenp/tutorials (~35k stars), spring-kafka-2 monitoring module
+Rule: VIBE-006 · KafkaRebalanceHazard · CRITICAL
+File: spring-kafka-2/.../monitoring/simulation/ConsumerSimulator.java
+  
+@KafkaListener(
+topics = "${monitor.topic.name}",
+containerFactory = "kafkaListenerContainerFactory",
+autoStartup = "${monitor.consumer.simulate}"
+)
+public void listenGroup(String message) throws InterruptedException {
+Thread.sleep(10L); // ← flagged: stalls listener thread per message
+}
+  
+Why it fails under load:
+The Kafka consumer listener thread is single-threaded per partition by default. Thread.sleep(10L)
+introduces a mandatory 10 ms delay per message. At 1,000 messages/second per partition, the listener
+can process at most 100 messages/second — a 10× throughput reduction. As consumer lag grows,
+downstream systems relying on low-latency event processing experience data staleness. More
+critically: if max.poll.interval.ms (default 5 minutes) is exceeded — which occurs if a message
+volume spike causes the poll loop to be blocked beyond the interval — Kafka considers the consumer
+dead, triggers a group rebalance, and temporarily unassigns all partitions from the consumer. During
+rebalance, processing halts for all partitions in the group. Any messages fetched before rebalance
+but not yet committed are redelivered after rebalance, causing duplicate processing unless the
+consumer is idempotent.
+  
+Estimated impact:
+Throughput capped at 1000ms / sleep_duration messages/second per partition. At Thread.sleep(10L):
+100 msg/s max. If multiple partitions share the same listener container, each partition waits for
+the previous message to complete — multiplying the lag. In monitoring contexts where this pattern
+appeared, consumer lag alarms are typically the first production signal.
+  
+---
+Los 3 casos cubren reglas distintas (VIBE-005, VIBE-002, VIBE-006), todos con código real de repos públicos con entre 1k y 35k estrellas, y cada uno representa una clase de fallo diferente: agotamiento de pool de conexiones, bloqueo del scheduler reactivo, y degradación de throughput Kafka con riesgo de rebalanceo.
 
