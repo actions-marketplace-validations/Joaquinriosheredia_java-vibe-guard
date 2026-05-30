@@ -66,6 +66,15 @@ public class VibeGuardEngine {
                 .filter(p -> !p.toString().contains("/.git/"))
                 .filter(p -> !p.toString().contains("/target/"))
                 .filter(p -> !p.toString().contains("/build/"))
+                .filter(p -> !p.toString().contains("/test/"))
+                .filter(p -> !p.toString().contains("/tests/"))
+                .filter(p -> {
+                    String name = p.getFileName().toString();
+                    return !name.endsWith("Test.java")
+                        && !name.endsWith("Tests.java")
+                        && !name.endsWith("IT.java")
+                        && !name.endsWith("Spec.java");
+                })
                 .toList();
         } catch (IOException e) {
             log.error("Failed to walk directory {}: {}", root, e.getMessage());
