@@ -89,9 +89,13 @@ runs:
         [[ -n "$VG_RULE"   ]] && ARGS+=("--rule"   "$VG_RULE")
         [[ -n "$VG_IGNORE" ]] && ARGS+=("--ignore" "$VG_IGNORE")
 
-        # Run CLI: stream JSON to log via tee, save to file for parsing
+        # Run CLI: capture exit status without letting set -e abort the script.
+        # The shell runs with -e -o pipefail; a non-zero CLI exit (CRITICAL findings)
+        # would abort before we can write $GITHUB_OUTPUT. set +e disables that locally.
+        set +e
         node "$CLI" "${ARGS[@]}" | tee "$REPORT"
         SCAN_EXIT=${PIPESTATUS[0]}
+        set -e
 
         # Extract per-severity counts and healthy flag from stable JSON contract
         CRITICAL=$(jq '.summary.critical' "$REPORT")

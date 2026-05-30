@@ -35,11 +35,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Scan CLI source
+      - name: Scan mcp-server source
         id: guard
         uses: ./
         with:
-          path: 'cli'
+          path: 'mcp-server'
           fail-on: 'critical'
 
       - name: Print outputs
