@@ -40,6 +40,7 @@ jobs:
         uses: ./
         with:
           path: 'mcp-server'
+          ignore: 'test'
           fail-on: 'critical'
 
       - name: Print outputs
