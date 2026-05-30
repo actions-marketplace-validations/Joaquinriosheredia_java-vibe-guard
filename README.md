@@ -36,19 +36,7 @@ Vibe coding produces code that compiles, passes mocked unit tests, and fails in 
 
 ---
 
-## The Three Layers
-
-### Layer 1 — senior-architect (CLAUDE.md global gate)
-
-**When it acts:** before Claude writes a single line of code.
-
-**Mechanism:** mandatory rule in `~/.claude/CLAUDE.md` that forces Claude to internally run the `ai-risk-constraints.md` protocol before any relevant change. The protocol runs five checks (blast radius, reversibility, dependencies, architecture, security) and emits an explicit decision: `APPROVE / REJECT / APPROVE WITH RISKS`. If `REJECT`, Claude explains what fails and what is needed to approve it. If the gate doesn't pass, the code isn't written.
-
-**What it eliminates:** incorrect architectural decisions that no linter can see. Examples: introducing persistence where it shouldn't exist, adding a dependency that creates unnecessary coupling, generating code with shared state between requests in a stateless context, changing business logic without understanding the existing contract. It's the only point in the stack that can stop a change before it exists.
-
-**Limitation:** operates on declared intent, not written code. Cannot detect implementation errors arising from the gap between what the LLM said it would do and what it actually generated.
-
----
+## Two Layers
 
 ### Layer 2 — java-vibe-guard CLI (`cli/`)
 
@@ -96,12 +84,6 @@ claude mcp add java-vibe-guard -s user -- java -jar mcp-server/target/java-vibe-
        │
        ▼
 ┌─────────────────────────────┐
-│   LAYER 1: senior-architect │  ← "Should this be done?"
-│   Pre-code cognitive gate   │     APPROVE / REJECT
-└──────────────┬──────────────┘
-               │ APPROVE
-               ▼
-┌─────────────────────────────┐
 │   Claude generates code     │
 └──────────────┬──────────────┘
                │
@@ -118,7 +100,7 @@ claude mcp add java-vibe-guard -s user -- java -jar mcp-server/target/java-vibe-
 └─────────────────────────────┘
 ```
 
-The three layers are deliberately redundant in purpose but not in mechanism. The redundancy is correct because each layer has a different failure vector: the cognitive gate can approve incorrect code, the MCP may not be invoked, the CLI may have false negatives. None fail simultaneously against the same type of error.
+The two layers are deliberately redundant in purpose but not in mechanism. The redundancy is correct because each layer has a different failure vector: the MCP may not be invoked, the CLI may have false negatives. None fail simultaneously against the same type of error.
 
 ---
 
@@ -126,13 +108,13 @@ The three layers are deliberately redundant in purpose but not in mechanism. The
 
 | Anti-pattern | Layer that catches it |
 |---|---|
-| Incorrect architectural decision ("add persistence here") | Layer 1 |
 | `.get()` blocking inside `@Transactional` or `@KafkaListener` | Layers 2 + 3 |
 | Controller accessing repository directly | Layers 2 + 3 |
 | Endpoint without structured logging | Layers 2 + 3 |
 | Generated code the LLM declares correct but isn't | Layer 3 (immediate feedback) |
 | Regression introduced by refactoring | Layer 3 (post-change re-analysis) |
 | Technical debt in untouched legacy code | Layer 2 (CI audit) |
+
 
 ---
 
