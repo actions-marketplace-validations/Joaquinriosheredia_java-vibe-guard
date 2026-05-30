@@ -105,7 +105,7 @@ java-vibe-guard . --ignore generated,legacy,sandbox
 
 ## CI integration
 
-Exit code `1` if any CRITICAL finding, `0` otherwise.
+Exit code `1` if any CRITICAL finding, `0` otherwise (including when only MAJOR/WARNING issues are found).
 
 ```yaml
 # GitHub Actions
@@ -113,6 +113,42 @@ Exit code `1` if any CRITICAL finding, `0` otherwise.
   run: npx java-vibe-guard . --json | tee vibe-report.json
   # Fails the build on CRITICAL findings
 ```
+
+### JSON output contract
+
+`--json` emits a single JSON object to stdout. Schema is stable for CI parsing:
+
+```jsonc
+{
+  "timestamp": "2026-05-30T18:00:00.000Z",
+  "projectPath": "./my-project",
+  "filesScanned": 47,
+  "summary": {
+    "critical": 2,   // → exit code 1
+    "major": 1,
+    "warning": 3,
+    "info": 0
+  },
+  "healthy": false,  // true when critical === 0
+  "issues": [
+    {
+      "severity": "critical",   // critical | major | warning | info
+      "ruleId":   "blocking",   // blocking | layers | kafka | transactions | observability
+      "message":  "blocking .get() detected in @Scheduled method",
+      "location": "OutboxPublisher.java:55"
+    }
+  ]
+}
+```
+
+**Exit code contract:**
+
+| Condition | Exit code |
+|-----------|-----------|
+| At least one `critical` issue | `1` |
+| Only `major` / `warning` / `info` issues | `0` |
+| No issues found | `0` |
+| Scan error (path not found, no Java files) | `1` |
 
 ---
 

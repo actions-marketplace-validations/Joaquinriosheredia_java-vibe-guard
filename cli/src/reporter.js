@@ -69,9 +69,9 @@ export function printJSON(findings, projectPath, fileCount) {
     filesScanned: fileCount,
     summary: c,
     healthy: c.critical === 0,
-    findings: findings.map(f => ({
+    issues: findings.map(f => ({
       severity: f.severity,
-      rule: f.rule,
+      ruleId: f.rule,
       message: f.message,
       location: f.location,
     })),

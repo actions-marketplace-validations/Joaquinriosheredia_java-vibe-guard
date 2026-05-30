@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node bin/cli.js",
-    "test": "node bin/cli.js --json ."
+    "test": "node test/contract.test.js"
   },
   "keywords": [
     "java",
