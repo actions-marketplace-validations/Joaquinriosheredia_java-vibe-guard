@@ -293,7 +293,4 @@ Throughput capped at 1000ms / sleep_duration messages/second per partition. At T
 100 msg/s max. If multiple partitions share the same listener container, each partition waits for
 the previous message to complete — multiplying the lag. In monitoring contexts where this pattern
 appeared, consumer lag alarms are typically the first production signal.
-  
----
-Los 3 casos cubren reglas distintas (VIBE-005, VIBE-002, VIBE-006), todos con código real de repos públicos con entre 1k y 35k estrellas, y cada uno representa una clase de fallo diferente: agotamiento de pool de conexiones, bloqueo del scheduler reactivo, y degradación de throughput Kafka con riesgo de rebalanceo.
 
