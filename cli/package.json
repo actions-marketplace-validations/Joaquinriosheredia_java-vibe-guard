@@ -11,13 +11,18 @@
     "test": "node test/contract.test.js"
   },
   "keywords": [
-    "java",
     "spring-boot",
-    "static-analysis",
-    "vibe-coding",
-    "code-quality",
+    "java",
     "kafka",
-    "architecture"
+    "static-analysis",
+    "code-quality",
+    "anti-pattern",
+    "runtime",
+    "production",
+    "architecture",
+    "mcp",
+    "claude-code",
+    "developer-tools"
   ],
   "license": "MIT",
   "dependencies": {

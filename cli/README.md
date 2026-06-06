@@ -193,3 +193,19 @@ Without structured logging at endpoints, debugging production incidents requires
 ## License
 
 MIT
+
+---
+
+## Ecosystem
+
+The npm CLI provides lightweight repository scanning with 5 rules.
+For AST-based analysis with 7 rules and Claude Code integration, 
+use the MCP server.
+
+| Tool | Rules | Engine | Use case |
+|------|-------|--------|----------|
+| CLI (this package) | 5 | Regex | Quick scan, CI/CD |
+| MCP Server | 7 | AST | Claude Code integration |
+| GitHub Action | 5 | Regex | Automatic PR scanning |
+
+Full ecosystem: https://github.com/Joaquinriosheredia/java-vibe-guard
