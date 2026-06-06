@@ -2,6 +2,8 @@
 
 [![GitHub Action](https://img.shields.io/badge/GitHub_Action-available-blue?logo=github-actions)](https://github.com/Joaquinriosheredia/java-vibe-guard/actions)
 
+💬 [Feedback, false positives & rule requests](https://github.com/Joaquinriosheredia/java-vibe-guard/discussions)
+
 ![java-vibe-guard demo](https://raw.githubusercontent.com/Joaquinriosheredia/java-vibe-guard-demo/master/demo.gif)
 
 A multi-layer defense system against vibe coding anti-patterns in Java/Spring Boot projects. Combines static analysis, MCP-native tooling, and cognitive governance to catch production bugs that compile cleanly and fail under load.
