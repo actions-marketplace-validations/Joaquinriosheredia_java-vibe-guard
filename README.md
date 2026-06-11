@@ -59,6 +59,82 @@ All rules share the same design principles: explicit annotation gate (no inferen
 
 ---
 
+## Why These Rules Exist
+
+Each rule was designed around a failure mode observed in [Java-Production-Labs](https://github.com/Joaquinriosheredia/Java-Production-Labs) — a benchmark suite of 10 Spring Boot labs exercised under real load and fault injection. Rules without a direct lab observation are marked *theoretical* and will be promoted to *observed* once empirical evidence is collected.
+
+---
+
+### VIBE-001 — `TransactionalAsyncRule`
+
+**Detects:** `.get()` / `.block()` inside `@Transactional` — a Kafka or HTTP send that holds the DB write lock open until the external call resolves, risking connection pool exhaustion and silent event loss on broker failure.
+
+**Observed in:** [Lab 04 — Transactional Outbox Pattern](https://github.com/Joaquinriosheredia/Java-Production-Labs/tree/main/04_outbox_kafka)
+
+**Evidence:** The `@Transactional pollAndPublish()` poller held a DB write lock during each Kafka send batch. A chaos run revealed that when `send()` partially committed before a failure, events were silently marked `FAILED` and never retried — `findPendingEvents()` only queried `status = 'PENDING'`, making FAILED events permanently invisible to the poller. Five events were confirmed permanently undeliverable in the optimization run before the bug was fixed.
+
+---
+
+### VIBE-002 — `ReactorBlockingCallRule`
+
+**Detects:** `.block()` / `.blockFirst()` / `.toFuture().get()` in a reactive `@RestController` or `@Service` — pins a thread from `Schedulers.parallel()` (fixed-size, CPU-core-count pool) for the full duration of the I/O operation, which can stall all reactive pipeline scheduling.
+
+**Observed in:** *Theoretical* — no direct Java-Production-Labs lab covers Project Reactor. A confirmed wild-code instance is documented in the [Found in the Wild](#found-in-the-wild) section below (eugenp/tutorials, `spring-reactive-4`).
+
+**Evidence:** Theoretical until a reactive lab is added. The wild-code case shows `.block()` on `Schedulers.parallel()` exhausting all available scheduler threads under concurrent load.
+
+---
+
+### VIBE-003 — `JpaNPlusOneRule`
+
+**Detects:** Repository calls (`findById`, `save`, `delete`) inside a loop or stream lambda — each iteration issues a separate SQL round trip, producing N database queries for a collection of N elements.
+
+**Observed in:** [Lab 07 — PostgreSQL Tuning](https://github.com/Joaquinriosheredia/Java-Production-Labs/tree/main/07_postgres_tuning)
+
+**Evidence:** Benchmark observed ~23× query time degradation when queries ran without a partial index on a 100K-row table (~285ms sequential scan vs. ~12ms index scan against 5% selective rows). N+1 patterns that issue per-entity queries amplify this cost linearly with collection size — each unindexed lookup triggers a full sequential scan at the same ~285ms baseline.
+
+---
+
+### VIBE-004 — `VirtualThreadsMisuseRule`
+
+**Detects:** `synchronized` or `ThreadLocal` usage in a Virtual Threads context — both constructs pin the carrier platform thread for the duration of the synchronized block or scoped access, negating the scheduling benefit of virtual threads and reproducing platform-thread contention.
+
+**Observed in:** [Lab 01 — Virtual Threads](https://github.com/Joaquinriosheredia/Java-Production-Labs/tree/main/01_virtual_threads)
+
+**Evidence:** Benchmark measured 7.4× throughput gain (1,058 req/s vs. 142 req/s) and 12× lower median latency (103ms vs. 1,280ms) with a virtual thread executor versus a fixed platform thread pool of 20 under 200 concurrent VUs. Code using `synchronized` inside virtual thread context reverts to platform-thread pinning behavior, suppressing the throughput gains demonstrated in this lab.
+
+---
+
+### VIBE-005 — `ConnectionPoolStarvationRule`
+
+**Detects:** Blocking external call (HTTP, sleep, file I/O, `Future.get()`) inside `@Transactional` — holds a HikariCP connection open during the blocking operation, reducing available pool slots and accelerating exhaustion under concurrent load.
+
+**Observed in:** [Lab 05 — Saga Pattern](https://github.com/Joaquinriosheredia/Java-Production-Labs/tree/main/05_saga_pattern)
+
+**Evidence:** `kafka.send().get()` inside `@Transactional startSaga()` observed to block HTTP threads when Kafka was unreachable — 60% of requests failed or timed out (35 of 50) during a simulated broker outage, while the actuator health endpoint continued reporting `UP`. The dual-write race condition produced 71.8% of orders permanently stuck in `STARTED` state with no recovery path, confirming that blocking sends inside transactions create both availability and consistency failures simultaneously.
+
+---
+
+### VIBE-006 — `KafkaRebalanceHazardRule`
+
+**Detects:** `@KafkaListener` without explicit `groupId`, or a blocking call inside a listener thread — delays offset commit, risks exceeding `max.poll.interval.ms`, and can trigger a consumer group rebalance that halts partition processing across the entire group.
+
+**Observed in:** [Lab 08 — Kafka Streams](https://github.com/Joaquinriosheredia/Java-Production-Labs/tree/main/08_kafka_streams)
+
+**Evidence:** Synchronous `kafkaTemplate.send(...).get()` on the message-processing path caused 60% request failure rate and observed latency of 15,000ms during broker fault injection. Critically, Spring Actuator reported `UP` and Streams state reported `RUNNING` throughout the outage — a confirmed false-positive health signal that would suppress alerting while the service was effectively non-functional for new message delivery.
+
+---
+
+### VIBE-007 — `MdcContextLeakRule`
+
+**Detects:** `MDC.put()` in `@Async` / `@Scheduled` without `MDC.clear()` — leaks request-scoped diagnostic context (request ID, customer ID, trace ID) across thread reuse in a shared thread pool, contaminating unrelated log lines in subsequent requests.
+
+**Observed in:** *Theoretical* — no Java-Production-Labs lab directly benchmarks MDC propagation failures.
+
+**Evidence:** Theoretical until an observability lab is added. This pattern was identified and remediated in the java-vibe-guard MCP server itself (CWE-117, commit `3aa5448`) where unsanitized MDC values in `OrderController` and `SagaController` could inject newlines into structured log output.
+
+---
+
 ## The Problem
 
 Vibe coding produces code that compiles, passes mocked unit tests, and fails in production under real load. LLMs generate syntactically plausible patterns that violate architectural invariants only visible at runtime — blocking calls inside transactions, direct cross-layer access, missing observability. No single tool catches all of them because they operate at different points in the development cycle.
