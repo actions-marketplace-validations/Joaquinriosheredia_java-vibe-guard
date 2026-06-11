@@ -10,6 +10,8 @@ A multi-layer defense system against vibe coding anti-patterns in Java/Spring Bo
 
 ## Quick Start
 
+**Prerequisites:** node, jq, git
+
 ### CLI
 ```bash
 npx java-vibe-guard ./your-spring-project
