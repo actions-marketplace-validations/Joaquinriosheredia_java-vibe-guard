@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -e
+
+command -v node >/dev/null 2>&1 || { echo "Error: node is required"; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required. Install with: apt install jq / brew install jq"; exit 1; }
+
 TARGET="/tmp/demo-target"
 REPO="https://github.com/eugenp/tutorials.git"
 
@@ -7,7 +11,7 @@ if [ ! -d "$TARGET" ]; then
   git clone $REPO $TARGET
 fi
 
-RESULT=$(npx java-vibe-guard "$TARGET" --json)
+RESULT=$(npx --yes java-vibe-guard@1.0.1 "$TARGET" --json)
 CRITICAL=$(echo "$RESULT" | jq '.issues[] | select(.severity=="CRITICAL")')
 EXIT_CODE=0
 
