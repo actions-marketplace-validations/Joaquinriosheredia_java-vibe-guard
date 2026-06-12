@@ -4,13 +4,13 @@ const SEVERITY_ICON  = { critical: '❌', major: '❌', warning: '⚠️ ', info
 const SEVERITY_ORDER = { critical: 0, major: 1, warning: 2, info: 3 };
 
 const EVIDENCE_MAP = {
-  blocking: {
+  'blocking': {
     lab: 'Java Production Lab #04 — Transactional Outbox',
     conditions: '500 VUs, HikariCP pool=20',
     metrics: ['throughput -74%', 'p99 +18.2s', 'pool exhausted after 13.9s'],
     link: 'https://github.com/Joaquinriosheredia/Java-Production-Labs/tree/main/04_outbox_kafka',
   },
-  kafka: {
+  'blocking-kafka': {
     lab: 'Java Production Lab #08 — Kafka Streams',
     conditions: 'broker fault injection',
     metrics: ['60% request failure rate', 'health check false positive (actuator reported UP)', 'recovery < 200ms after broker restored'],

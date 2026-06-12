@@ -1,6 +1,6 @@
 {
   "name": "java-vibe-guard",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Static analyzer that detects vibe coding patterns in Java/Spring Boot projects",
   "type": "module",
   "bin": {

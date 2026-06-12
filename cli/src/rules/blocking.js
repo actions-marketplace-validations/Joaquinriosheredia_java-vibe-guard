@@ -44,7 +44,7 @@ export function checkBlocking(fileContexts) {
           if (re.test(lines[i])) {
             findings.push({
               severity: 'critical',
-              rule: 'blocking',
+              rule: annotationName === '@KafkaListener' ? 'blocking-kafka' : 'blocking',
               message: `${name} detected in ${annotationName} method`,
               location: `${fileName}:${i + 1}`,
             });
