@@ -3,6 +3,33 @@ import chalk from 'chalk';
 const SEVERITY_ICON  = { critical: '❌', major: '❌', warning: '⚠️ ', info: 'ℹ️ ' };
 const SEVERITY_ORDER = { critical: 0, major: 1, warning: 2, info: 3 };
 
+const EVIDENCE_MAP = {
+  blocking: {
+    lab: 'Java Production Lab #04 — Transactional Outbox',
+    conditions: '500 VUs, HikariCP pool=20',
+    metrics: ['throughput -74%', 'p99 +18.2s', 'pool exhausted after 13.9s'],
+    link: 'https://github.com/Joaquinriosheredia/Java-Production-Labs/tree/main/04_outbox_kafka',
+  },
+  kafka: {
+    lab: 'Java Production Lab #08 — Kafka Streams',
+    conditions: 'broker fault injection',
+    metrics: ['60% request failure rate', 'health check false positive (actuator reported UP)', 'recovery < 200ms after broker restored'],
+    link: 'https://github.com/Joaquinriosheredia/Java-Production-Labs/tree/main/08_kafka_streams',
+  },
+};
+
+function formatEvidence(rule) {
+  const e = EVIDENCE_MAP[rule];
+  if (!e) return null;
+  const lines = [
+    chalk.gray(`  Evidence: ${e.lab}`),
+    chalk.gray(`  Observed under controlled conditions (${e.conditions}):`),
+    ...e.metrics.map(m => chalk.gray(`  → ${m}`)),
+    chalk.gray(`  Reproduce: ${e.link}`),
+  ];
+  return lines.join('\n');
+}
+
 function label(severity) {
   switch (severity) {
     case 'critical': return chalk.red.bold('CRITICAL');
@@ -29,6 +56,10 @@ export function printFindings(findings) {
   for (const f of sorted) {
     const icon = SEVERITY_ICON[f.severity] ?? 'ℹ️ ';
     console.log(`${icon} ${label(f.severity)}: ${f.message} → ${chalk.cyan(f.location)}`);
+    if (f.severity === 'critical') {
+      const evidence = formatEvidence(f.rule);
+      if (evidence) console.log(evidence);
+    }
   }
 }
 
