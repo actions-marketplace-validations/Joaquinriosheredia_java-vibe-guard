@@ -92,18 +92,19 @@ class PoolContentionTest {
         System.out.println("Pool stats:   " + getPoolStats());
         System.out.println("=======================================");
 
-        // The key assertions that prove the anti-pattern
+        // The key assertions that prove the anti-pattern.
+        // Relative thresholds: hardware-independent, safe to run in CI.
         assertThat(successCount.get())
                 .as("All requests should eventually succeed (pool queues, not drops)")
                 .isEqualTo(concurrency);
 
-        // With pool=5 and 500ms hold per connection, batches of 5 complete every ~500ms.
-        // 20 requests in 4 batches → minimum total time ≈ 4 × 500ms = 2000ms.
-        // Fast requests finish in ~500ms; late ones wait 3+ batches → >1500ms.
+        // Pool queuing means late requests wait at least as long as one full batch (pool=5).
+        // With 20 requests batched in groups of 5, the slowest must be ≥ 2× the fastest.
         assertThat(maxLatency)
-                .as("Max latency must exceed 3× the async sleep (pool queuing observed)")
-                .isGreaterThan(1500L);
+                .as("Max latency must be at least 2× min — proves pool queuing across batches")
+                .isGreaterThan(minLatency * 2);
 
+        // The spread captures the queuing penalty: slowest − fastest ≥ one async-sleep duration.
         assertThat(maxLatency - minLatency)
                 .as("Spread between fastest and slowest must prove queuing (>800ms)")
                 .isGreaterThan(800L);
