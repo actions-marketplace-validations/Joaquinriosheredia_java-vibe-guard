@@ -29,3 +29,29 @@ jobs:
       - name: Run VIBE-001 pool contention test
         working-directory: verify/vibe-001/app
         run: mvn test
+
+  verify-vibe-001:
+    name: VIBE-001 — CLI verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CLI dependencies
+        working-directory: cli
+        run: npm ci
+
+      - name: Run java-vibe-guard --verify VIBE-001
+        run: node cli/bin/cli.js --verify VIBE-001
