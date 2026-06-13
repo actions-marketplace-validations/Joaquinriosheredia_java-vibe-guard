@@ -33,6 +33,8 @@ jobs:
   verify-vibe-001:
     name: VIBE-001 — CLI verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +56,7 @@ jobs:
         run: npm ci
 
       - name: Install testcontainers-doctor
-        run: npm install -g testcontainers-doctor
+        run: npm install -g --ignore-scripts testcontainers-doctor@1.0.0
 
       - name: Run java-vibe-guard --verify VIBE-001
         run: node cli/bin/cli.js --verify VIBE-001
