@@ -17,6 +17,22 @@ A multi-layer defense system against vibe coding anti-patterns in Java/Spring Bo
 npx java-vibe-guard ./your-spring-project
 ```
 
+### Runtime verification (`--verify`)
+
+Reproduces a VIBE rule's anti-pattern in a live environment and confirms the phenomenon is observable.
+
+**Additional prerequisite:** `testcontainers-doctor` must be installed globally (used for environment pre-check):
+```bash
+npm install -g testcontainers-doctor
+```
+
+**Usage:**
+```bash
+npx java-vibe-guard --verify VIBE-001
+```
+
+Requires Docker 24+, Java 17+, and 512 MB of free memory.
+
 ### GitHub Actions (CI)
 ```yaml
 - uses: Joaquinriosheredia/java-vibe-guard@v1

@@ -53,5 +53,8 @@ jobs:
         working-directory: cli
         run: npm ci
 
+      - name: Install testcontainers-doctor
+        run: npm install -g testcontainers-doctor
+
       - name: Run java-vibe-guard --verify VIBE-001
         run: node cli/bin/cli.js --verify VIBE-001
