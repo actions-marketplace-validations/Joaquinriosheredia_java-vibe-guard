@@ -22,6 +22,8 @@
         <!-- docker-java 3.3.x defaults to API 1.32; Docker Engine 23+ requires min 1.44.
              Testcontainers 1.20.x ships docker-java 3.4.x which uses API 1.44 by default. -->
         <testcontainers.version>1.20.4</testcontainers.version>
+        <!-- Output path for VerifyRunner metrics; overridable via -Dvibe.output.file=... -->
+        <vibe.output.file>/tmp/vibe-001-metrics.json</vibe.output.file>
     </properties>
 
     <dependencies>
@@ -76,6 +78,9 @@
                          Docker Engine 23+ requires minimum API 1.44 (default in shaded lib is 1.32). -->
                     <systemPropertyVariables>
                         <api.version>1.44</api.version>
+                        <!-- Forward Maven properties to the forked test JVM -->
+                        <vibe.output.file>${vibe.output.file}</vibe.output.file>
+                        <vibe.verify>${vibe.verify}</vibe.verify>
                     </systemPropertyVariables>
                 </configuration>
             </plugin>

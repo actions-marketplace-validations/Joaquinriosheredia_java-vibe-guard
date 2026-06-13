@@ -1,0 +1,162 @@
+import { spawn, execFileSync } from 'child_process';
+import { join, dirname } from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
+import chalk from 'chalk';
+
+const __dirname  = dirname(fileURLToPath(import.meta.url));
+const VERIFY_DIR = join(__dirname, '../../verify');
+
+// ── PASO 1 helpers ───────────────────────────────────────────────────────────
+
+function runTCDoctor() {
+  return new Promise((resolve) => {
+    const tc = spawn('testcontainers-doctor', ['--json', '--no-color'], { timeout: 15_000 });
+    let out = '';
+    tc.stdout.on('data', (d) => { out += d; });
+    tc.on('close', () => {
+      try { resolve(JSON.parse(out)); }
+      catch { resolve(null); }
+    });
+    tc.on('error', () => resolve(null));
+  });
+}
+
+function findCheck(data, section, name) {
+  return data?.sections?.[section]?.find((x) => x.name === name);
+}
+
+function parseDockerMajor(msg = '') {
+  const m = String(msg).match(/^(\d+)\./);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+function parseMemoryMB(msg = '') {
+  const m = String(msg).match(/([\d.]+)\s*(GB|MB)/i);
+  if (!m) return 0;
+  return m[2].toUpperCase() === 'GB' ? parseFloat(m[1]) * 1024 : parseFloat(m[1]);
+}
+
+function parseJavaMajor(msg = '') {
+  const m = String(msg).match(/major:\s*(\d+)/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+// ── PASO 2 helper ─────────────────────────────────────────────────────────────
+
+function imageIsCached(image) {
+  try {
+    execFileSync('docker', ['image', 'inspect', image], { stdio: 'ignore', timeout: 5_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ── PASO 4 renderer ──────────────────────────────────────────────────────────
+
+function renderResult(result) {
+  console.log('');
+  console.log(chalk.bold('VIBE-001 Verification'));
+  console.log('');
+
+  if (result.status === 'error') {
+    console.log(chalk.red(`✗ Verification error: ${result.error}`));
+    return;
+  }
+
+  const { poolUtilization, waitingRequests, p95LatencyMs } = result.metrics;
+  const okUtil  = poolUtilization >= 95;
+  const okWait  = waitingRequests > 0;
+  const okP95   = p95LatencyMs >= 800;
+
+  console.log('Observed:');
+  console.log(
+    okUtil
+      ? chalk.green(`✓ Connection pool fully utilized (utilization: ${poolUtilization.toFixed(0)}%)`)
+      : chalk.red(`✗ Pool not fully utilized (utilization: ${poolUtilization.toFixed(0)}%)`)
+  );
+  console.log(
+    okWait
+      ? chalk.green(`✓ Requests blocked waiting for connections (waiting: ${waitingRequests})`)
+      : chalk.red(`✗ No requests blocked waiting (waiting: ${waitingRequests})`)
+  );
+  console.log(
+    okP95
+      ? chalk.green(`✓ Latency amplification under concurrency (p95: ${p95LatencyMs}ms)`)
+      : chalk.red(`✗ Insufficient latency amplification (p95: ${p95LatencyMs}ms)`)
+  );
+
+  console.log('');
+  console.log('Matches behavior documented in:');
+  console.log(chalk.cyan('Java Production Lab #04'));
+  console.log('');
+}
+
+// ── Main entry ────────────────────────────────────────────────────────────────
+
+export async function runVerify(rule) {
+  // Load registry lazily so unknown rules fail early
+  const { registry } = await import(pathToFileURL(join(VERIFY_DIR, 'registry.js')).href);
+
+  if (!registry[rule]) {
+    console.error(chalk.red(`Unknown rule: ${rule}. Available: ${Object.keys(registry).join(', ')}`));
+    return 2;
+  }
+
+  // ── PASO 1: Environment pre-check ─────────────────────────────────────────
+  console.log('');
+  console.log(chalk.bold('Environment Check'));
+
+  const tc = await runTCDoctor();
+
+  if (!tc) {
+    console.log(chalk.red('✗ testcontainers-doctor not found — run: npm install -g testcontainers-doctor'));
+    return 2;
+  }
+
+  const dockerMajor = parseDockerMajor(findCheck(tc, 'docker', 'Docker client version')?.message);
+  const memMB       = parseMemoryMB(findCheck(tc, 'docker', 'Available memory')?.message);
+  const javaMajor   = parseJavaMajor(findCheck(tc, 'java',   'Java version')?.message);
+
+  const dockerOk = dockerMajor >= 24;
+  const memOk    = memMB       >= 512;
+  const javaOk   = javaMajor   >= 17;
+
+  console.log(dockerOk
+    ? chalk.green(`✓ Docker ${dockerMajor}.x`)
+    : chalk.red(`✗ Docker ${dockerMajor}.x (need 24+)`));
+  console.log(javaOk
+    ? chalk.green(`✓ Java ${javaMajor}`)
+    : chalk.red(`✗ Java ${javaMajor} (need 17+)`));
+  console.log(memOk
+    ? chalk.green('✓ Memory OK')
+    : chalk.red(`✗ Memory too low (${Math.round(memMB)}MB free, need 512MB)`));
+
+  if (!dockerOk || !memOk || !javaOk) {
+    console.log(chalk.red('\nEnvironment check failed — fix issues above before running --verify'));
+    return 2;
+  }
+
+  // ── PASO 2: Image cache check ─────────────────────────────────────────────
+  console.log('');
+  if (!imageIsCached('postgres:16-alpine')) {
+    console.log(chalk.gray('postgres:16-alpine not found'));
+    console.log(chalk.gray('First run will download image (~45s)'));
+    console.log(chalk.gray('Subsequent runs: ~15s'));
+    console.log('');
+  }
+
+  // ── PASO 3: Run verifier ──────────────────────────────────────────────────
+  console.log(chalk.gray('Running VIBE-001 verification…'));
+
+  const verifierPath = join(VERIFY_DIR, registry[rule].verifier, 'index.js');
+  const { run } = await import(pathToFileURL(verifierPath).href);
+  const result = await run();
+
+  // ── PASO 4: Render output ─────────────────────────────────────────────────
+  renderResult(result);
+
+  if (result.status === 'pass')  return 0;
+  if (result.status === 'fail')  return 1;
+  return 2;
+}
