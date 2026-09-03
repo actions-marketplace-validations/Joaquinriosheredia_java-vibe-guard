@@ -1,3 +1,5 @@
+import { stripComments } from './strip-comments.js';
+
 const CONTROLLER_RES = [/@RestController\b/, /@Controller\b/];
 const REPO_FIELD_RE  = /private\s+(final\s+)?(\w*[Rr]epository\b)/;
 const REPO_PARAM_RE  = /[,(]\s*(\w*[Rr]epository\b)/;
@@ -7,10 +9,14 @@ const KAFKA_PARAM_RE = /[,(]\s*KafkaTemplate\b/;
 export function checkLayers(fileContexts) {
   const findings = [];
 
-  for (const { filePath, lines, fileName } of fileContexts) {
+  for (const { filePath, lines, relativePath } of fileContexts) {
     if (!filePath.endsWith('.java')) continue;
 
-    const content = lines.join('\n');
+    // Issue #9: strip comments before the file-level gate — a comment merely
+    // mentioning "@RestController"/"@Controller"/"@ControllerAdvice" must not
+    // open detection for a file that isn't really a controller. The per-line
+    // finding loop below (using raw `line`) is unaffected — out of scope.
+    const content = stripComments(lines.join('\n'));
     if (/@ControllerAdvice\b/.test(content)) continue;
     if (!CONTROLLER_RES.some(re => re.test(content))) continue;
 
@@ -28,7 +34,7 @@ export function checkLayers(fileContexts) {
           severity: 'major',
           rule: 'layers',
           message: `Controller accessing Repository directly (${repoName})`,
-          location: `${fileName}:${i + 1}`,
+          location: `${relativePath}:${i + 1}`,
         });
       }
 
@@ -38,7 +44,7 @@ export function checkLayers(fileContexts) {
           severity: 'major',
           rule: 'layers',
           message: 'Controller using KafkaTemplate directly (bypass Service layer)',
-          location: `${fileName}:${i + 1}`,
+          location: `${relativePath}:${i + 1}`,
         });
       }
     }

@@ -6,7 +6,7 @@
 
 ![java-vibe-guard demo](https://raw.githubusercontent.com/Joaquinriosheredia/java-vibe-guard/master/demo-screenshot.png)
 
-A multi-layer defense system against vibe coding anti-patterns in Java/Spring Boot projects. Combines static analysis, MCP-native tooling, and cognitive governance to catch production bugs that compile cleanly and fail under load.
+A multi-layer defense system against vibe coding anti-patterns in Java/Spring Boot projects. Combines static analysis and MCP-native tooling to catch production bugs that compile cleanly and fail under load.
 
 ## Quick Start
 
@@ -35,7 +35,7 @@ Requires Docker 24+, Java 17+, and 512 MB of free memory.
 
 ### GitHub Actions (CI)
 ```yaml
-- uses: Joaquinriosheredia/java-vibe-guard@v1
+- uses: Joaquinriosheredia/java-vibe-guard@v1.1.0
   with:
     path: '.'
     fail-on: 'critical'
@@ -61,7 +61,7 @@ java-vibe-guard/
 
 ## Active Rules — MCP Server (VIBE-001 to VIBE-007)
 
-**7 rules · 102 tests · 0 false positives**
+**7 rules · 143 tests**
 
 | Code | Rule | Description |
 |------|------|-------------|
@@ -135,11 +135,11 @@ Each rule was designed around a failure mode observed in [Java-Production-Labs](
 
 ### VIBE-006 — `KafkaRebalanceHazardRule`
 
-**Detects:** `@KafkaListener` without explicit `groupId`, or a blocking call inside a listener thread — delays offset commit, risks exceeding `max.poll.interval.ms`, and can trigger a consumer group rebalance that halts partition processing across the entire group.
+**Detects:** `@KafkaListener` without explicit `groupId`, or a blocking call inside a listener thread. **Scope:** the rule flags the blocking call itself as a risk signal — it does not read `max.poll.interval.ms` from configuration and does not evaluate whether the actual blocking duration would exceed it. A finding confirms the pattern is present, not that a rebalance will occur.
 
-**Observed in:** [Lab 08 — Kafka Streams](https://github.com/Joaquinriosheredia/Java-Production-Labs/tree/main/08_kafka_streams)
+**Observed in:** *Theoretical* — no Java-Production-Labs lab currently benchmarks blocking-listener-induced rebalance. [Lab 08 — Kafka Streams](https://github.com/Joaquinriosheredia/Java-Production-Labs/tree/main/08_kafka_streams) was previously cited here; on review it does not apply (see Evidence).
 
-**Evidence:** Synchronous `kafkaTemplate.send(...).get()` on the message-processing path caused 60% request failure rate and observed latency of 15,000ms during broker fault injection. Critically, Spring Actuator reported `UP` and Streams state reported `RUNNING` throughout the outage — a confirmed false-positive health signal that would suppress alerting while the service was effectively non-functional for new message delivery.
+**Evidence:** No verified production case yet for the blocking→`max.poll.interval.ms`→rebalance path. The mechanism is real and documented in the Kafka consumer specification: a blocking call inside `@KafkaListener` delays the consumer's next `poll()`, and if that delay exceeds `max.poll.interval.ms` the group coordinator marks the consumer dead and triggers a rebalance that halts partition processing across the group — but this project has not reproduced it in a benchmark of its own. Lab 08 was previously cited as evidence here; it does not apply: Lab 08 has no `@KafkaListener` anywhere in its source (`app/src/main/java`) — it's a Kafka Streams DSL app. The blocking call it exhibited, `kafkaTemplate.send(...).get(5, TimeUnit.SECONDS)` in `StreamController.publishOrder()` (`app/src/main/java/com/labs/kafkastreams/controller/StreamController.java:53`), runs on an HTTP request thread inside a `@RestController` endpoint, not a consumer listener thread — it cannot trigger a group rebalance by this mechanism. The 60% request-failure rate and false `UP`/`RUNNING` health signal that benchmark measured are real findings, but they are evidence for the CLI's `kafka-send-timeout` rule (unbounded/under-timed blocking producer send — see CHANGELOG), not for `KafkaRebalanceHazardRule`. Rule retained as a defensive best practice based on the documented Kafka mechanism, pending a benchmark that actually reproduces blocking-listener → rebalance.
 
 ---
 
@@ -149,7 +149,7 @@ Each rule was designed around a failure mode observed in [Java-Production-Labs](
 
 **Observed in:** *Theoretical* — no Java-Production-Labs lab directly benchmarks MDC propagation failures.
 
-**Evidence:** Theoretical until an observability lab is added. This pattern was identified and remediated in the java-vibe-guard MCP server itself (CWE-117, commit `3aa5448`) where unsanitized MDC values in `OrderController` and `SagaController` could inject newlines into structured log output.
+**Evidence:** No verified production case from Java-Production-Labs yet. Rule retained as a defensive best practice based on the documented risk of thread-pool reuse corrupting MDC context across `@Async`/`@Scheduled` executions, pending a real-world incident to confirm it in the wild.
 
 ---
 
@@ -183,7 +183,7 @@ Add to any Java project's workflow — no installation required:
 
 ```yaml
 - name: java-vibe-guard
-  uses: Joaquinriosheredia/java-vibe-guard@v1
+  uses: Joaquinriosheredia/java-vibe-guard@v1.1.0
   with:
     path: '.'            # directory to scan (default: .)
     fail-on: 'critical'  # fail step on CRITICAL findings (default)
@@ -192,13 +192,14 @@ Add to any Java project's workflow — no installation required:
 Full options:
 
 ```yaml
-- uses: Joaquinriosheredia/java-vibe-guard@v1
+- uses: Joaquinriosheredia/java-vibe-guard@v1.1.0
   with:
     path: '.'
-    rule: ''             # blank = all rules; or: blocking | layers | kafka | transactions | observability
+    rule: ''             # blank = all rules; or: blocking | blocking-kafka | kafka | kafka-send-timeout | layers | transactions | observability | reactor-block
     ignore: 'labs,demo'  # comma-separated dirs to skip
     fail-on: 'critical'  # critical | never
     upload-report: 'true'  # attach JSON report as artifact
+    sarif: 'false'          # generate a SARIF report and upload it to GitHub Code Scanning (opt-in)
 
   # Outputs available in subsequent steps:
   #   ${{ steps.guard.outputs.critical }}
@@ -206,9 +207,10 @@ Full options:
   #   ${{ steps.guard.outputs.warning }}
   #   ${{ steps.guard.outputs.healthy }}
   #   ${{ steps.guard.outputs.report-json }}
+  #   ${{ steps.guard.outputs.report-sarif }}  # only set when sarif: 'true'
 ```
 
-The action writes a markdown table to the GitHub Actions summary panel and uploads the full JSON report as a workflow artifact (30-day retention).
+The action writes a markdown table to the GitHub Actions summary panel and uploads the full JSON report as a workflow artifact (30-day retention). When `sarif: 'true'`, it also generates a SARIF 2.1.0 report and uploads it directly to GitHub Code Scanning via `github/codeql-action/upload-sarif` (requires `@v1.1.0` or later — not available on `@v1`).
 
 ---
 
@@ -220,7 +222,7 @@ The action writes a markdown table to the GitHub Actions summary panel and uploa
 
 **What it adds over the CLI:** closes the feedback loop within the same session. Instead of manually running the CLI and pasting the output, Claude can analyze, see the results, fix, and re-analyze in a single conversation. Also serves as a validation signal Claude can use to confirm that a change it just made didn't introduce new anti-patterns.
 
-**Limitation:** same as the CLI, inheriting its static analysis constraints. Also depends on Claude deciding to invoke the tool — it is not an automatic barrier like the senior-architect gate.
+**Limitation:** same as the CLI, inheriting its static analysis constraints. Also depends on Claude deciding to invoke the tool — it is not an automatic barrier.
 
 ```bash
 # Build
@@ -264,9 +266,12 @@ The two layers are deliberately redundant in purpose but not in mechanism. The r
 
 | Anti-pattern | Layer that catches it |
 |---|---|
-| `.get()` blocking inside `@Transactional` or `@KafkaListener` | Layers 2 + 3 |
-| Controller accessing repository directly | Layers 2 + 3 |
-| Endpoint without structured logging | Layers 2 + 3 |
+| `.get()`/`.block()` blocking inside `@Transactional` | Layer 3 only (VIBE-001, VIBE-005) |
+| Blocking call inside `@KafkaListener` | Layers 2 + 3 (cli `blocking-kafka` + VIBE-006) |
+| Kafka `send().get()` with no timeout argument | Layer 2 only (cli `kafka-send-timeout`) |
+| `.block()`/`.blockFirst()`/`.blockLast()`/`.toFuture().get()` in a Reactor chain inside an `@Service`/`@RestController`/`@Component` class, in any method other than `@Test`/`@PostConstruct`/`main()` | Layers 2 + 3 (cli `reactor-block` + VIBE-002) |
+| Controller accessing repository directly | Layer 2 only (cli `layers`) |
+| Endpoint without structured logging | Layer 2 only (cli `observability`) |
 | Generated code the LLM declares correct but isn't | Layer 3 (immediate feedback) |
 | Regression introduced by refactoring | Layer 3 (post-change re-analysis) |
 | Technical debt in untouched legacy code | Layer 2 (CI audit) |
@@ -276,117 +281,32 @@ The two layers are deliberately redundant in purpose but not in mechanism. The r
 
 ## Stack Evaluation
 
-What makes it solid is not the sophistication of any individual layer, but that the pipeline operates at zero marginal cost per analysis: the cognitive gate is part of Claude's process, the MCP is a tool call within the session, the CLI is executable in any CI without licenses. The total system cost is zero. The only real cost is not having it: production code with anti-patterns that only fail under load.
+What makes it solid is not the sophistication of any individual layer, but that the pipeline operates at zero marginal cost per analysis: the MCP is a tool call within the session, the CLI is executable in any CI without licenses. The total system cost is zero. The only real cost is not having it: production code with anti-patterns that only fail under load.
 
 ---
 
 ## Validation
 
-- **102 tests**, 0 false positives.
-- Validated on **17,137 real files** across 10 Spring Boot repositories.
-- **0 confirmed false positives** in CRITICAL rules.
+- **143 tests**, 0 false positives — MCP's curated unit test suite (`mvn test` in `mcp-server/`).
+- CLI `validate-public` pipeline run on **2 real-world Spring Boot repositories**,
+  pinned to fixed commits (see [`validation/repos.json`](validation/repos.json)):
+  - [`eugenp/tutorials`](https://github.com/eugenp/tutorials) @ `ccab8a7` — 29,141 files scanned
+  - [`spring-projects/spring-petclinic`](https://github.com/spring-projects/spring-petclinic) @ `88e37c1` — 77 files scanned
+  - **29,218 files scanned in total.**
+- Both repository validations completed successfully. Reproducibility was
+  verified by running the pipeline twice against the same pinned commits:
+  the resulting JSON artifacts were byte-identical except for the four
+  run-specific fields excluded by docs/validation-contract.md §5.
+- CLI version `1.0.3`. Per-rule/per-repo finding counts (2,909 findings
+  reported in this run) are not reproduced here — see the generated
+  artifact (`validation/results/summary.json`) for the detailed breakdown.
 
 ## Found in the Wild
 
-Finding 1 — VIBE-005: @Transactional on @RestController holds DB connections during HTTP serialization
-  
-Repo: eugenp/tutorials (~35k stars), JHipster 8 monolithic module
-Rule: VIBE-005 · ConnectionPoolStarvation · MAJOR
-File: jhipster-8-modules/jhipster-8-monolithic/.../web/rest/AuthorityResource.java
-  
-@RestController
-@RequestMapping("/api/authorities")
-@Transactional // ← flagged
-public class AuthorityResource {
-  
-@GetMapping("")
-public List<Authority> getAllAuthorities() {
-return authorityRepository.findAll();
-}
-  
-@DeleteMapping("/{id}")
-public ResponseEntity<Void> deleteAuthority(@PathVariable String id) {
-authorityRepository.deleteById(id);
-return ResponseEntity.noContent()...build();
-}
-}
-  
-Why it fails under load:
-@Transactional on the class means every endpoint opens a DB connection on the first repository call
-and holds it open until the method fully returns — which includes JSON serialization of the response
-body, header writing, and Tomcat's response commit. DB serialization is measured in microseconds;
-HTTP response finalization under load can take milliseconds of extra latency as the response buffer
-flushes. At 500 concurrent requests against a pool capped at 20 connections, the 480 threads queuing
-for a connection accumulate serialization latency and keep connections checked out longer than
-necessary, accelerating pool exhaustion.
-  
-Estimated impact:
-~10–30% connection hold-time overhead per request; at sustained load, connection pool exhaustion
-causes HikariCP - Connection is not available, request timed out after 30000ms errors. JHipster
-scaffolding generates this pattern for every admin resource controller, so the issue is typically
-replicated across all CRUD controllers in a generated codebase.
-  
----
-Finding 2 — VIBE-002: .block() called on Schedulers.parallel() thread
-  
-Repo: eugenp/tutorials (~35k stars), spring-reactive-modules
-Rule: VIBE-002 · ReactorBlockingCall · CRITICAL
-File: spring-reactive-modules/spring-reactive-4/.../service/FileContentSearchService.java
-  
-public Mono<Boolean> blockingSearchOnParallelThreadPool(String fileName, String searchTerm) {
-return Mono.just("")
-.publishOn(Schedulers.parallel()) // switches to parallel scheduler
-.map(s -> fileService.getFileContentAsString(fileName)
-.block() // ← flagged: blocks a parallel thread
-.contains(searchTerm));
-}
-  
-Why it fails under load:
-Schedulers.parallel() is a fixed-size thread pool sized to
-Runtime.getRuntime().availableProcessors() — typically 4 to 8 threads on production hardware. Its
-intended use is CPU-bound computation, not I/O. Calling .block() inside a map operator pinned to
-this scheduler occupies one of those threads for the entire duration of the file read. With 5
-concurrent requests on a 4-core machine, all parallel threads are blocked waiting for file I/O; no
-further reactive operators — including other pending HTTP responses, ongoing DB queries, or
-WebClient calls — can be scheduled. The effect is functionally equivalent to a deadlock from the
-reactive pipeline's perspective.
-  
-Estimated impact:
-Under concurrent load, complete stall of all reactive work scheduled on Schedulers.parallel(). On a
-4-core server, 4 simultaneous requests to this endpoint render the service unresponsive to all
-reactive traffic until the blocked threads are released.
-  
----
-Finding 3 — VIBE-006: Thread.sleep() inside @KafkaListener delays acknowledgement and triggers rebalances
-  
-Repo: eugenp/tutorials (~35k stars), spring-kafka-2 monitoring module
-Rule: VIBE-006 · KafkaRebalanceHazard · CRITICAL
-File: spring-kafka-2/.../monitoring/simulation/ConsumerSimulator.java
-  
-@KafkaListener(
-topics = "${monitor.topic.name}",
-containerFactory = "kafkaListenerContainerFactory",
-autoStartup = "${monitor.consumer.simulate}"
-)
-public void listenGroup(String message) throws InterruptedException {
-Thread.sleep(10L); // ← flagged: stalls listener thread per message
-}
-  
-Why it fails under load:
-The Kafka consumer listener thread is single-threaded per partition by default. Thread.sleep(10L)
-introduces a mandatory 10 ms delay per message. At 1,000 messages/second per partition, the listener
-can process at most 100 messages/second — a 10× throughput reduction. As consumer lag grows,
-downstream systems relying on low-latency event processing experience data staleness. More
-critically: if max.poll.interval.ms (default 5 minutes) is exceeded — which occurs if a message
-volume spike causes the poll loop to be blocked beyond the interval — Kafka considers the consumer
-dead, triggers a group rebalance, and temporarily unassigns all partitions from the consumer. During
-rebalance, processing halts for all partitions in the group. Any messages fetched before rebalance
-but not yet committed are redelivered after rebalance, causing duplicate processing unless the
-consumer is idempotent.
-  
-Estimated impact:
-Throughput capped at 1000ms / sleep_duration messages/second per partition. At Thread.sleep(10L):
-100 msg/s max. If multiple partitions share the same listener container, each partition waits for
-the previous message to complete — multiplying the lag. In monitoring contexts where this pattern
-appeared, consumer lag alarms are typically the first production signal.
+All three "Found in the Wild" candidates investigated so far were retracted after contextual audit against the pinned commit — checked for real callers, real test coverage, and (for the case below) the technical accuracy of the mechanism the rule claims to detect. None currently stands as valid field evidence for its rule; see below for why each was retracted.
 
+- `FileContentSearchService.java` (`spring-reactive-modules/spring-reactive-4/.../service/`, `eugenp/tutorials`) — a `.block()` call flagged as VIBE-002 evidence — is one method in a six-method side-by-side comparison of correct and incorrect Reactor blocking patterns, built for a Baeldung tutorial article (route prefix `bael7724`). Its own integration test (`FileSearchAPIIntegrationTest.givenAFileNameAndASearchTerm_whenParallelThreadPoolAPIIsHit_thenReturnAServerError`) asserts that the flagged endpoint *should* return a 5xx error — the "failure" is the documented, intended teaching outcome, not a bug.
+- `ConsumerSimulator.java` (`spring-kafka-2/.../monitoring/simulation/`, `eugenp/tutorials`) — a `Thread.sleep()` inside a `@KafkaListener` flagged as VIBE-006 evidence — is an intentional Kafka lag simulator: `Thread.sleep(10L)` is the mechanism that deliberately creates consumer lag for a companion `LagAnalyzerService` to detect and display. Both `monitor.consumer.simulate` and `monitor.producer.simulate` default to `true` in the module's `application.properties`, confirming the module is designed to run as a demonstration.
+- `AuthorityResource.java` (`jhipster-8-modules/jhipster-8-monolithic/.../web/rest/`, `eugenp/tutorials`) — `@Transactional` on a `@RestController` class, flagged as VIBE-005 evidence — was retracted for a different reason than the two findings above. The `@Transactional` annotation is real, unmodified JHipster-generated scaffolding (confirmed against the pinned commit and the JHipster README), not demo/tutorial code — so this is not a "there's no `@Transactional` here" retraction. It is retracted because the mechanism the README attributed to it was technically incorrect: Spring's `TransactionInterceptor` commits the transaction and releases the JDBC connection synchronously, inside the same method invocation that wraps the controller call, *before* control returns to Spring MVC's return-value handling — `HttpMessageConverter`/Jackson serialization only begins after that invocation has already completed (`TransactionAspectSupport.invokeWithinTransaction`, `JpaTransactionManager.doCleanupAfterCompletion`, `ServletInvocableHandlerMethod.invokeAndHandle` — Spring Framework source). The project also runs with `spring.jpa.open-in-view=false`, ruling out Open Session In View as an alternate path to the same claimed effect. The connection being held open *during a blocking call inside the transactional method body* remains a valid, real mechanism (that's what `ConnectionPoolStarvationRule` actually detects, per its rule definition above) — what does not hold is the claim that the connection stays open through HTTP serialization *after* the method returns.
+
+No replacement examples were added — the goal is honest evidence, not a fixed count of findings.
