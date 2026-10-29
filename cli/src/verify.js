@@ -1,24 +1,57 @@
-import { spawn, execFileSync } from 'child_process';
+import { execFileSync } from 'child_process';
+import { runBounded } from './child-process.js';
+import { createRequire } from 'module';
+import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import chalk from 'chalk';
 
 const __dirname  = dirname(fileURLToPath(import.meta.url));
-const VERIFY_DIR = join(__dirname, '../../verify');
+// verify/ lives inside cli/ (moved in 2.0.0) so it ships in the npm package;
+// it used to sit at the repo root, outside cli/, and `npm publish` from cli/
+// would have left --verify unable to find its registry.
+const VERIFY_DIR = join(__dirname, '../verify');
+const require    = createRequire(import.meta.url);
 
 // ── PASO 1 helpers ───────────────────────────────────────────────────────────
 
-function runTCDoctor() {
-  return new Promise((resolve) => {
-    const tc = spawn('testcontainers-doctor', ['--json', '--no-color'], { timeout: 15_000 });
-    let out = '';
-    tc.stdout.on('data', (d) => { out += d; });
-    tc.on('close', () => {
-      try { resolve(JSON.parse(out)); }
-      catch { resolve(null); }
-    });
-    tc.on('error', () => resolve(null));
-  });
+// testcontainers-doctor is a dependency of this package (pinned: verify
+// parses its message text). Resolve its bin from node_modules and run it with
+// this same Node binary — no global install needed. Falls back to a binary on
+// PATH only if the dependency is missing (e.g. a checkout without npm ci).
+function tcDoctorCommand() {
+  try {
+    const pkgPath = require.resolve('testcontainers-doctor/package.json');
+    const { bin } = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    const binRel  = typeof bin === 'string' ? bin : bin['testcontainers-doctor'];
+    return { cmd: process.execPath, args: [join(dirname(pkgPath), binRel)] };
+  } catch {
+    return { cmd: 'testcontainers-doctor', args: [] };
+  }
+}
+
+// verify only needs the doctor's `docker` and `java` sections. Running just
+// those (`--check`, in parallel) skips its network checks (Docker Hub DNS,
+// image pull), which made a full run exceed the old 15 s timeout on slow
+// networks/CI runners. Resolves { sections } or { error: 'timeout'|'failed' }.
+const TC_DOCTOR_TIMEOUT_MS = 60_000;
+
+// stdout (the JSON) and stderr are both read (runBounded): before 2.2.1 the
+// doctor's stderr was never read, the same unread-stream risk that hung Maven.
+async function runTCDoctorCheck(check) {
+  const { cmd, args } = tcDoctorCommand();
+  const tc = await runBounded(cmd, [...args, '--json', '--no-color', '--check', check],
+    { timeoutMs: TC_DOCTOR_TIMEOUT_MS, keepStdout: true });
+  if (tc.timedOut) return { error: 'timeout' };
+  try { return { sections: JSON.parse(tc.stdout).sections ?? {} }; }
+  catch { return { error: 'failed' }; }
+}
+
+async function runTCDoctor() {
+  const results = await Promise.all(['docker', 'java'].map(runTCDoctorCheck));
+  const failed = results.find(r => r.error);
+  if (failed) return { error: failed.error };
+  return { sections: Object.assign({}, ...results.map(r => r.sections)) };
 }
 
 function findCheck(data, section, name) {
@@ -109,8 +142,12 @@ export async function runVerify(rule) {
 
   const tc = await runTCDoctor();
 
-  if (!tc) {
-    console.log(chalk.red('✗ testcontainers-doctor not found — run: npm install -g testcontainers-doctor'));
+  if (tc.error === 'timeout') {
+    console.log(chalk.red(`✗ testcontainers-doctor did not finish within ${TC_DOCTOR_TIMEOUT_MS / 1000}s — is the Docker daemon responsive?`));
+    return 2;
+  }
+  if (tc.error) {
+    console.log(chalk.red('✗ testcontainers-doctor could not be run — reinstall java-vibe-guard (it ships as a dependency)'));
     return 2;
   }
 

@@ -98,7 +98,7 @@ const fixtureFindings = [
   finding({
     rule: 'kafka-send-timeout',
     severity: 'critical',
-    message: 'Kafka send().get() without timeout — blocks the calling thread indefinitely if the broker is slow or unavailable; use .get(timeout, TimeUnit) or handle the future asynchronously',
+    message: 'Kafka send().get() without timeout — if the broker is slow or unavailable, the calling thread stays blocked until the producer gives up: up to delivery.timeout.ms (120 s with the Kafka client defaults), plus up to max.block.ms (60 s by default) inside send() while metadata is unavailable; use .get(timeout, TimeUnit) or handle the future asynchronously',
     location: 'src/main/java/com/example/saga/SagaOrderService.java:45',
   }),
   finding({
@@ -134,7 +134,7 @@ const fixtureFindings = [
   finding({
     rule: 'reactor-block',
     severity: 'critical',
-    message: "Reactive blocking call '.block()' inside Spring bean — pins a thread under load; use reactive composition (.flatMap, .map, .then) instead",
+    message: "Reactive blocking call '.block()' inside Spring bean — on a Reactor thread (Netty event loop or Schedulers.parallel() worker) it throws IllegalStateException on every call (measured); compose with .flatMap()/.then() instead, or, if the call must block, run it in Mono.fromCallable(...).subscribeOn(Schedulers.boundedElastic()) (a bounded pool: capacity = threads / call duration)",
     location: 'src/main/java/com/example/search/FileContentSearchService.java:12',
   }),
   finding({

@@ -8,14 +8,16 @@
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { mkdtempSync, copyFileSync, rmSync, writeFileSync, mkdirSync } from 'fs';
+import { mkdtempSync, copyFileSync, rmSync, writeFileSync, mkdirSync, cpSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
+import { ledgerTotals, breakdownFromJson, diffAgainstLedger, OPT_IN_LEDGER } from './fixture-ledger.js';
 import { applySuppressions } from '../src/suppression.js';
 import { loadConfig } from '../src/config.js';
-import { RULES, RULE_FN_ALIASES } from '../src/scanner.js';
+import { RULES, RULE_FN_ALIASES, dropFindingsShadowedByReactorBlock } from '../src/scanner.js';
 import { checkBlocking } from '../src/rules/blocking.js';
 import { checkKafkaSendTimeout } from '../src/rules/kafka.js';
 import { checkReactorBlock } from '../src/rules/reactor-block.js';
+import { RULE_CATALOG } from '../src/rule-catalog.js';
 import { checkObservability } from '../src/rules/observability.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -43,10 +45,13 @@ function run(args) {
 // Runs a single fixture file in isolation (copied into its own temp dir) so results
 // from other fixtures in test-fixtures/ can't leak in. collectFiles() requires a
 // directory argument, not a file, hence the copy.
-function runOnFixture(fixtureFileName, rule) {
+// { enableAsync: true } also copies EnableAsyncConfig.java: since 2.3.0 an @Async anchor
+// counts only when the scanned tree has @EnableAsync (enable-async.js).
+function runOnFixture(fixtureFileName, rule, { enableAsync = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'vibe-guard-fixture-'));
   try {
     copyFileSync(join(FIXTURES, fixtureFileName), join(dir, fixtureFileName));
+    if (enableAsync) copyFileSync(join(FIXTURES, 'EnableAsyncConfig.java'), join(dir, 'EnableAsyncConfig.java'));
     const { stdout } = run(['--json', '--rule', rule, dir]);
     return JSON.parse(stdout);
   } finally {
@@ -303,6 +308,57 @@ console.log('\n📋 Test 5: fixture-by-fixture detection');
   assert(findings[0].location === 'DocOnlyExample.java:18', 'the one real finding keeps its correct line number (18) — unaffected by the multi-line comment above it');
 }
 
+// async-returns-pending-future (B0 v1) ────────────────────────────────────
+{
+  // Design approved 2026-10-06 (vibe-guard docs/FASE-3-b0-deteccion-diseno.md): M1-M8 and
+  // M10 reported, plus M2 over M8 (2026-10-09), by exact location; every other shape in
+  // these modules is 0, including the v2 shapes M9 and N5 (accepted false negatives in v1).
+  const { stdout } = run(['--json', '--rule', 'async-returns-pending-future', join(FIXTURES, 'async-pending-future')]);
+  const issues = JSON.parse(stdout).issues;
+  const got = issues.map(i => `${i.severity} ${i.location}`).sort();
+  const want = [
+    'critical base/src/main/java/demo/ReportService.java:28',        // M1 supplyAsync
+    'critical base/src/main/java/demo/ReportService.java:31',        // M2 thenApply over M1
+    'critical base/src/main/java/demo/ReportService.java:34',        // M3 thenApplyAsync
+    'critical base/src/main/java/demo/ReportService.java:37',        // M4 WebClient, multi-line, at the return
+    'critical base/src/main/java/demo/ReportService.java:43',        // M5 HttpClient.sendAsync
+    'critical base/src/main/java/demo/ReportService.java:47',        // M6 KafkaTemplate.send via a local
+    'critical base/src/main/java/demo/ReportService.java:52',        // M7 completed only in a callback
+    'critical base/src/main/java/demo/ReportService.java:56',        // M8 allOf with a pending argument
+    'critical base/src/main/java/demo/ReportService.java:60',        // M2 thenApply over M8 (approved 2026-10-09)
+    'critical base/src/main/java/demo/SelfInjectedService.java:19',  // M10, same default executor
+    'critical base/src/main/java/demo/SelfInjectedService.java:28',  // M10, different executor
+    'critical custom-executor/src/main/java/demo/CeService.java:17', // M10, own executor
+    'warning virtual-threads/src/main/java/demo/VtService.java:18',  // M1 with virtual threads
+    'warning virtual-threads/src/main/java/demo/VtService.java:19',  // M10 with virtual threads
+  ].sort();
+  assert(JSON.stringify(got) === JSON.stringify(want), `async-pending-future fixtures: expected ${want.join(', ')}; got ${got.join(', ')}`);
+
+  const at = loc => issues.find(i => i.location.endsWith(loc)).message;
+  const deadlock = /starvation deadlock/;
+  assert(deadlock.test(at('SelfInjectedService.java:19')) && /SelfInjectedService\.inner\(\)/.test(at('SelfInjectedService.java:19'))
+    && /blob\/11651ca\/cli\/verify\/async-pending-future\/results\/criteria\.md#L51-L61/.test(at('SelfInjectedService.java:19')),
+    'M10 on the same default executor: deadlock message with the measured source (g)');
+  for (const loc of ['SelfInjectedService.java:28', 'CeService.java:17', 'VtService.java:19', 'ReportService.java:28']) {
+    assert(!deadlock.test(at(loc)) && /saturates like a blocking call/.test(at(loc)) && /criteria\.md#L15-L23/.test(at(loc)),
+      `${loc}: H message (saturation), no deadlock claim`);
+  }
+  assert(issues.filter(i => i.severity === 'warning').every(i => /WARNING, not CRITICAL: spring\.threads\.virtual\.enabled=true/.test(i.message) && /criteria\.md#L47-L49/.test(i.message)),
+    'virtual threads: WARNING suffix citing (f)');
+  assert(/\(CompletableFuture\.supplyAsync\(\.\.\.\)\)/.test(at('ReportService.java:28')), 'the message names the shape');
+}
+{
+  // The measured experiment's own app: P (N5) and PN between two beans (M9) are not
+  // detected in v1, by design; K (completedFuture) is not either.
+  const { stdout } = run(['--json', '--rule', 'async-returns-pending-future', join(__dirname, '../verify/async-pending-future')]);
+  assert(JSON.parse(stdout).issues.length === 0, 'verify/async-pending-future app: 0 findings in v1 (P = N5 and PN = M9 are v2)');
+}
+{
+  const c = RULE_CATALOG['async-returns-pending-future'];
+  assert(/NOT detected in this version/.test(c.full) && /downstream\.call\(\)\.thenApply/.test(c.full) && /otherBean\.asyncMethod\(\)/.test(c.full)
+    && /analysis across files/.test(c.full), '--explain says v1 does not detect N5 nor M9, and why');
+}
+
 // reactor-block ────────────────────────────────────────────────────────────
 {
   // ReactorBlockTruePositive.java mirrors mcp-server's own VIBE-002 fixture:
@@ -311,7 +367,8 @@ console.log('\n📋 Test 5: fixture-by-fixture detection');
   const json = runOnFixture('ReactorBlockTruePositive.java', 'reactor-block');
   assert(json.issues.length === 4, 'ReactorBlockTruePositive.java produces exactly 4 findings (one per blocking pattern)');
   assert(json.issues.every(i => i.ruleId === 'reactor-block'), 'all ReactorBlockTruePositive findings have ruleId "reactor-block"');
-  assert(json.issues.every(i => i.severity === 'critical'), 'all ReactorBlockTruePositive findings are critical');
+  // 2.4.0 (Phase 1 (c)): plain statements of a @Service, no evidence of a Reactor thread.
+  assert(json.issues.every(i => i.severity === 'warning'), 'all ReactorBlockTruePositive findings are warnings (thread unknown, 2.4.0)');
 }
 {
   // Ported from mcp-server's ReactorBlockingFalsePositive.java: @PostConstruct,
@@ -319,6 +376,114 @@ console.log('\n📋 Test 5: fixture-by-fixture detection');
   // never calls .block() at all — none of these five should ever be flagged.
   const json = runOnFixture('ReactorBlockFalsePositive.java', 'reactor-block');
   assert(json.issues.length === 0, 'ReactorBlockFalsePositive.java produces 0 findings');
+}
+{
+  // Precision (verify/reactor-block variants A4 and C): only the exact measured shapes of
+  // .block() are skipped; everything else in these modules is still reported.
+  const { stdout } = run(['--json', '--rule', 'reactor-block', join(FIXTURES, 'reactor-block-precision')]);
+  const got = JSON.parse(stdout).issues.map(i => `${i.severity} ${i.location}`).sort();
+  const want = [
+    'critical both/src/main/java/demo/MixedController.java:12',        // MVC + WebFlux: stack unknown, handler
+    'critical mvc-only/src/main/java/demo/MvcController.java:35',      // operator after subscribeOn(parallel())
+    'warning mvc-only/src/main/java/demo/MvcController.java:41',       // .toFuture().get(): servlet worker (2.4.0)
+    'warning mvc-only/src/main/java/demo/MvcController.java:47',       // .blockFirst(): servlet worker (2.4.0)
+    'warning mvc-only/src/main/java/demo/MvcService.java:14',          // Service: callers unknown (2.4.0)
+    'critical webflux/src/main/java/demo/ReactiveController.java:21',  // plain .block() on the event loop
+    'critical webflux/src/main/java/demo/ReactiveController.java:37',  // subscribeOn(parallel())
+    'warning webflux/src/main/java/demo/ReactiveController.java:45',   // publishOn after boundedElastic (2.4.0)
+    'warning webflux/src/main/java/demo/ReactiveController.java:54',   // .blockFirst() on boundedElastic (2.4.0)
+  ].sort();
+  assert(JSON.stringify(got) === JSON.stringify(want), `reactor-block precision fixtures: expected ${want.join(', ')}; got ${got.join(', ')}`);
+  for (const skipped of ['MvcController.java:21', 'MvcController.java:27', 'ReactiveController.java:26', 'ReactiveController.java:31']) {
+    assert(!got.some(l => l.endsWith(skipped)), `measured-safe shape at ${skipped} is not reported`);
+  }
+}
+{
+  // 2.4.0 thread context (Phase 1 (c), design approved 2026-10-14): CRITICAL only with
+  // evidence of a Reactor thread in the file; unknown thread -> WARNING, never silence;
+  // known non-Reactor Spring contexts of the same method -> not reported.
+  const CTX = join(FIXTURES, 'reactor-block-context');
+  const { stdout } = run(['--json', '--rule', 'reactor-block', CTX]);
+  const got = JSON.parse(stdout).issues.map(i => `${i.severity} ${i.location.replace('webflux/src/main/java/demo/', '')}`).sort();
+  const want = [
+    'critical HandlerController.java:21',   // (2) WebFlux handler: .block()
+    'critical HandlerController.java:27',   // (4) WebFlux handler: .toFuture().get()
+    'critical HandlerController.java:34',   // fromCallable, no subscribeOn, in a handler
+    'warning HandlerController.java:39',    // private helper: not a handler
+    'critical OperatorService.java:25',     // (1) map callback (parallel runOn)
+    'critical OperatorService.java:33',     // (1) multi-line block lambda, nested if
+    'critical OperatorService.java:41',     // (1) nested call inside the lambda
+    'critical OperatorService.java:48',     // (1) anonymous class passed to map
+    'critical OperatorService.java:55',     // (1) subscribe consumer
+    'critical OperatorService.java:62',     // (4) .toFuture().get() in an operator
+    'critical OperatorService.java:71',     // fromCallable + subscribeOn(parallel())
+    'warning OperatorService.java:77',      // statement of a @Service
+    'warning OperatorService.java:82',      // java.util.stream lambda: inline
+    'warning OperatorService.java:87',      // lambda of a constructor (QueueItem)
+    'warning OperatorService.java:94',      // anonymous class evaluated later
+    'warning OperatorService.java:101',     // fromCallable, no scheduler, not a handler
+    'warning OperatorService.java:106',     // private helper
+    'critical RouterHandlers.java:23',      // (3) ServerRequest
+    'critical RouterHandlers.java:30',      // (3) ServerWebExchange, signature over two lines
+    'warning StartupLifecycle.java:20',     // stop(): not excluded
+    'warning StartupReadyListener.java:20', // private helper of a listener
+    'warning StartupRunner.java:18',        // other method of a runner
+  ].sort();
+  assert(JSON.stringify(got) === JSON.stringify(want), `reactor-block context fixtures:\n    expected ${want.join(', ')}\n    got      ${got.join(', ')}`);
+  // Exact equality: the excluded methods (CommandLineRunner/ApplicationRunner.run,
+  // SmartLifecycle.start, ready/refreshed listeners, @EventListener(ApplicationReadyEvent),
+  // @Async with @EnableAsync) are absent.
+
+  // @Async counts only with @EnableAsync in the scanned tree (same rule as blocking).
+  const asyncFile = join(CTX, 'webflux/src/main/java/demo/AsyncWorker.java');
+  const ctx = (path) => ({ filePath: path, relativePath: path.split('/').pop(), lines: readFileSync(path, 'utf8').split('\n') });
+  const withConfig = checkReactorBlock([ctx(asyncFile), ctx(join(CTX, 'webflux/src/main/java/demo/AsyncConfig.java'))]);
+  assert(withConfig.length === 0, `@Async + @EnableAsync in the tree: not reported: got ${withConfig.length}`);
+  const without = checkReactorBlock([ctx(asyncFile)]);
+  assert(without.length === 1 && without[0].severity === 'warning', `@Async with no @EnableAsync (inert): a warning: got ${without.map(f => f.severity).join(',') || 'none'}`);
+
+  // Criterion 10: the warning separates detection, impact and reproduction, and does not
+  // claim a measured effect for its own case.
+  const w = JSON.parse(stdout).issues.find(i => i.severity === 'warning' && i.message.includes(".block()'"));
+  assert(/Detection: .*Impact: .*Reproduction: not available/.test(w.message), 'warning message has Detection / Impact / Reproduction, in that order');
+  assert(/cannot see/.test(w.message) && /no evidence that it runs on one/.test(w.message), 'warning message says the thread is not visible');
+  assert(/if a Reactor thread .* runs it, it throws IllegalStateException on every call \(measured\)/.test(w.message), 'the measured impact is stated as conditional on a Reactor thread');
+  const c = JSON.parse(stdout).issues.filter(i => i.severity === 'critical');
+  assert(c.every(i => /operator|WebFlux handler|non-blocking Reactor scheduler/.test(i.message)), 'every critical message names its evidence of a Reactor thread');
+}
+{
+  // The fixes the reactor-block messages recommend must not be flagged by reactor-block
+  // itself (decision 2026-10-05): .flatMap()/.then() composition, the boundedElastic
+  // escape hatch for a call that must block, and .subscribe().
+  const lines = [
+    'package demo;',
+    'import org.springframework.web.bind.annotation.RestController;',
+    'import reactor.core.publisher.Mono;',
+    'import reactor.core.scheduler.Schedulers;',
+    '@RestController',
+    'public class RecommendedFixes {',
+    '    private Client client;',
+    '    public Mono<String> composed() {',
+    '        return client.call().flatMap(x -> client.other(x));',
+    '    }',
+    '    public Mono<Void> then() {',
+    '        return client.call().then();',
+    '    }',
+    '    public Mono<String> mustBlock() {',
+    '        return Mono.fromCallable(() -> client.call().block()).subscribeOn(Schedulers.boundedElastic());',
+    '    }',
+    '    public void fireAndForget() {',
+    '        client.call().subscribe();',
+    '    }',
+    '    interface Client { Mono<String> call(); Mono<String> other(String s); }',
+    '}',
+  ];
+  const findings = checkReactorBlock([{ filePath: '/nonexistent/RecommendedFixes.java', relativePath: 'RecommendedFixes.java', lines }]);
+  assert(findings.length === 0, `the fixes recommended by reactor-block's messages are not flagged by it: got ${findings.map(f => f.location).join(', ')}`);
+  const messages = [...new Set(checkReactorBlock([{ filePath: '/nonexistent/X.java', relativePath: 'X.java', lines: [
+    'import reactor.core.publisher.Mono;', '@RestController', 'public class X {', '    public String a(Mono<String> m) throws Exception {',
+    '        String s = m.block();', '        return m.toFuture().get();', '    }', '}'] }]).map(f => f.message))];
+  assert(messages.length === 2 && messages.every(m => !/\.map\b/.test(m)), `no reactor-block message recommends .map (flagged when it wraps a blocking call): ${messages.join(' | ')}`);
 }
 {
   // Gate (a): same @Service + .block() shape as the true positive, but the
@@ -572,7 +737,7 @@ console.log('\n📋 Test 5a4: BLOCKING_PATTERNS window comment-stripping (issue 
 // verified not to have silenced real detection on any of the four.
 console.log('\n📋 Test 5a5: real detection unaffected on @Async / @EventListener (A3.1)');
 {
-  const json = runOnFixture('BlockingAsyncEventListenerTruePositive.java', 'blocking');
+  const json = runOnFixture('BlockingAsyncEventListenerTruePositive.java', 'blocking', { enableAsync: true });
   assert(json.issues.length === 2, 'BlockingAsyncEventListenerTruePositive.java produces exactly 2 findings (@Async + @EventListener)');
   if (json.issues.length === 2) {
     assert(json.issues.some(i => i.message.includes('@Async')), 'one finding is inside the @Async method');
@@ -580,27 +745,83 @@ console.log('\n📋 Test 5a5: real detection unaffected on @Async / @EventListen
   }
 }
 
-// ─── Test 5a6: A3.2 (window/method-boundary misattribution) is NOT fixed by
-// A3.1 — known limitation, documented on purpose ──────────────────────────
-// This is a regression guard in the opposite direction from the rest of this
-// file: it asserts the BUG is still present, so A3.1 doesn't get silently
-// mistaken for a full fix of blocking.js's window scan. The
-// BLOCKING_PATTERNS window only stops early on hitting ANOTHER annotated
-// line — it does not track the annotated method's actual closing brace, so a
-// blocking call in a later, unrelated, unannotated method within the same
-// 60-line window is still misattributed to the annotation above it.
-// unrelatedHelper()'s Thread.sleep() is real code, not a comment —
-// stripComments() does nothing for it. Fixing this for real is A3.2,
-// tracked separately and NOT part of this commit. If this assertion ever
-// starts failing (0 findings instead of 1), A3.2 was fixed — update this
-// test to reflect that deliberately, don't just delete it.
-console.log('\n📋 Test 5a6: A3.2 window misattribution — known limitation, still open');
+// ─── Test 5a6: A3.2 (window/method-boundary misattribution) — FIXED ───────
+// Was a regression guard in the opposite direction (asserting the bug was
+// still present, so A3.1 didn't get mistaken for a full fix). A3.2 replaced
+// blocking.js's fixed 60-line window with extractMethodBodyRange()'s real
+// structural boundary (method-body.js) — consume()'s scan now correctly
+// stops at its own closing brace and never reaches unrelatedHelper()'s
+// Thread.sleep() below it. This is a legitimate disappearance of a
+// misattributed finding, not a suppressed real one — see
+// BlockingWindowMisattributionProbe.java's own header comment. If this
+// assertion ever starts failing again (1 finding instead of 0), the
+// structural boundary regressed.
+console.log('\n📋 Test 5a6: A3.2 window misattribution — fixed');
 {
   const json = runOnFixture('BlockingWindowMisattributionProbe.java', 'blocking-kafka');
-  assert(json.issues.length === 1, 'BlockingWindowMisattributionProbe.java still produces 1 (incorrect) finding — A3.2 not fixed by this commit');
+  assert(json.issues.length === 0, 'BlockingWindowMisattributionProbe.java produces 0 findings — A3.2 fixed the structural misattribution');
+}
+
+// ─── Test 5a7-5a12: A3.2 structural extractor regression fixtures ─────────
+// One dedicated fixture per case from the A3.2 design (point 2), plus the
+// 4.b double-anchor preservation case and the 2.e safety-cap case. Each
+// asserted in isolation, same pattern as 5a2-5a6.
+console.log('\n📋 Test 5a7: A3.2 case (a) — multi-line annotation args');
+{
+  const json = runOnFixture('BlockingMultiLineAnnotationProbe.java', 'blocking');
+  assert(json.issues.length === 1, 'BlockingMultiLineAnnotationProbe.java produces exactly 1 finding');
   if (json.issues.length === 1) {
-    assert(json.issues[0].location.includes('BlockingWindowMisattributionProbe.java'), 'the misattributed finding is still reported against this fixture');
+    assert(json.issues[0].message.includes('@Scheduled'), 'the finding is inside the @Scheduled method');
+    assert(json.issues[0].location.endsWith(':17'), 'the finding anchors to the real Thread.sleep() line (17), past the multi-line annotation');
   }
+}
+
+console.log('\n📋 Test 5a8: A3.2 case (b) — stacked annotation with braces in its args');
+{
+  const json = runOnFixture('BlockingStackedAnnotationBracesProbe.java', 'blocking-kafka');
+  assert(json.issues.length === 1, 'BlockingStackedAnnotationBracesProbe.java produces exactly 1 finding');
+  if (json.issues.length === 1) {
+    assert(json.issues[0].ruleId === 'blocking-kafka', 'the finding has ruleId "blocking-kafka"');
+    assert(json.issues[0].location.endsWith(':25'), 'the finding anchors to the real Thread.sleep() line (25) — @RetryableTopic\'s array-literal brace was not mistaken for the method body');
+  }
+}
+
+console.log('\n📋 Test 5a9: A3.2 case (c) — modifiers/generics/throws between anchor and method');
+{
+  const json = runOnFixture('BlockingModifiersGenericsThrowsProbe.java', 'blocking', { enableAsync: true });
+  assert(json.issues.length === 1, 'BlockingModifiersGenericsThrowsProbe.java produces exactly 1 finding');
+  if (json.issues.length === 1) {
+    assert(json.issues[0].message.includes('@Async'), 'the finding is inside the @Async method');
+  }
+}
+
+console.log('\n📋 Test 5a10: A3.2 case (d) — nested anonymous class inside the body');
+{
+  const json = runOnFixture('BlockingNestedAnonClassProbe.java', 'blocking');
+  assert(json.issues.length === 1, 'BlockingNestedAnonClassProbe.java produces exactly 1 finding');
+  if (json.issues.length === 1) {
+    assert(json.issues[0].message.includes('@EventListener'), 'the finding is inside the @EventListener method');
+  }
+}
+
+console.log('\n📋 Test 5a11: A3.2 case (4.b) — double anchor on the same method preserved');
+{
+  // 0a (2.0.0): one call, one finding — was 2 (one per anchor) before.
+  const json = runOnFixture('BlockingDoubleAnchorProbe.java', 'blocking', { enableAsync: true });
+  assert(json.issues.length === 1, `BlockingDoubleAnchorProbe.java produces exactly 1 finding for its one Thread.sleep(): got ${json.issues.length}`);
+  if (json.issues.length === 1) {
+    assert(json.issues[0].location.endsWith(':20'), 'the finding anchors to the real Thread.sleep() line (20)');
+    assert(
+      json.issues[0].message === 'Thread.sleep() detected in method annotated @Async, @Scheduled',
+      `message names both anchors in source order: got "${json.issues[0].message}"`
+    );
+  }
+}
+
+console.log('\n📋 Test 5a12: A3.2 case (2.e) — 60-line safety cap preserved for anomalously long methods');
+{
+  const json = runOnFixture('BlockingAnomalouslyLongMethodProbe.java', 'blocking');
+  assert(json.issues.length === 0, 'BlockingAnomalouslyLongMethodProbe.java produces 0 findings — the real Thread.sleep() sits past the 60-line safety cap, accepted best-effort limitation (2.e), not a crash or hang');
 }
 
 // ─── Test 5b: --rule post-filter — blocking vs blocking-kafka (issue #7) ────
@@ -980,18 +1201,259 @@ console.log('\n📋 Test 18: malformed vibeguard.config.json does not break the 
   assert(exitCode === 1, 'exit code is 1 — malformed config does not mask a real critical');
 }
 
+// ─── Test 18b (0a): typed Future.get() and reactor-block dedup ───────────────
+console.log('\n📋 Test 18b: Future.get() on Future-typed receivers; .block() reported once');
+{
+  // Coverage lost in 7a18298 (issue #5), restored without its false positive.
+  const tp = runOnFixture('BlockingFutureGetTruePositive.java', 'blocking', { enableAsync: true });
+  const tpLines = tp.issues.map(i => Number(i.location.split(':').pop())).sort((a, b) => a - b);
+  assert(tp.issues.length === 4, `BlockingFutureGetTruePositive.java: 4 blocking findings (local, field, var, chained): got ${tp.issues.length}`);
+  assert(tpLines.join(',') === '26,32,39,44', `findings on the four .get() lines 26,32,39,44: got ${tpLines.join(',')}`);
+  assert(tp.issues.every(i => i.message.startsWith('blocking Future.get() detected in @')), 'message names Future.get() and the async anchor');
+
+  const dir = mkdtempSync(join(tmpdir(), 'vibe-guard-fixture-'));
+  try {
+    copyFileSync(join(FIXTURES, 'BlockingFutureGetFalsePositive.java'), join(dir, 'BlockingFutureGetFalsePositive.java'));
+    const fp = JSON.parse(run(['--json', dir]).stdout);
+    assert(fp.issues.length === 0, `BlockingFutureGetFalsePositive.java: 0 findings from any rule (Optional/Map/timed get/comment/name): got ${fp.issues.length}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  // 2.4.0: @Async with @EnableAsync is excluded from reactor-block (task executor), so the
+  // Mono.block() of the 0a duplicate probe is reported once, under blocking.
+  const dupDir = mkdtempSync(join(tmpdir(), 'vibe-guard-fixture-'));
+  try {
+    copyFileSync(join(FIXTURES, 'ReactorBlockAsyncDuplicateProbe.java'), join(dupDir, 'ReactorBlockAsyncDuplicateProbe.java'));
+    copyFileSync(join(FIXTURES, 'EnableAsyncConfig.java'), join(dupDir, 'EnableAsyncConfig.java'));
+    const all = JSON.parse(run(['--json', dupDir]).stdout);
+    const at23 = all.issues.filter(i => i.location.endsWith(':23'));
+    assert(at23.length === 1 && at23[0].ruleId === 'blocking' && at23[0].severity === 'critical', `Mono.block() line 23 reported once, as blocking critical: got ${at23.map(i => i.ruleId).join(',') || 'none'}`);
+    const at24 = all.issues.filter(i => i.location.endsWith(':24'));
+    assert(at24.length === 1 && at24[0].ruleId === 'blocking', 'Thread.sleep() on line 24 is a different call — still reported under blocking');
+    assert(all.summary.reported === 2, `2 findings in total: got ${all.summary.reported}`);
+  } finally {
+    rmSync(dupDir, { recursive: true, force: true });
+  }
+
+  // 2.4.0 dedup: one finding per .block(), and never a lower severity than blocking's.
+  const schedDir = mkdtempSync(join(tmpdir(), 'vibe-guard-fixture-'));
+  try {
+    copyFileSync(join(FIXTURES, 'ReactorBlockScheduledDuplicateProbe.java'), join(schedDir, 'ReactorBlockScheduledDuplicateProbe.java'));
+    const all = JSON.parse(run(['--json', schedDir]).stdout);
+    const at = (n) => all.issues.filter(i => i.location.endsWith(`:${n}`)).map(i => `${i.ruleId}/${i.severity}`).join(',');
+    assert(at(20) === 'blocking/critical', `@Scheduled .block(): blocking critical kept, reactor-block warning dropped: got ${at(20)}`);
+    assert(at(25) === 'reactor-block/critical', `.block() in an operator callback: reactor-block critical kept, blocking dropped: got ${at(25)}`);
+    const onlyBlocking = JSON.parse(run(['--json', '--rule', 'blocking', schedDir]).stdout);
+    assert(
+      onlyBlocking.issues.some(i => i.location.endsWith(':25')),
+      '--rule blocking alone (reactor-block not run) still reports the .block() under blocking'
+    );
+  } finally {
+    rmSync(schedDir, { recursive: true, force: true });
+  }
+
+  // 0a: Evidence lines cite only evidence that measures the rule's own mechanism.
+  const evDir = mkdtempSync(join(tmpdir(), 'vibe-guard-fixture-'));
+  try {
+    for (const f of ['BlockingTruePositive.java', 'KafkaBlockingProbe.java', 'KafkaSendTimeoutTruePositive.java', 'ReactorBlockTruePositive.java']) {
+      copyFileSync(join(FIXTURES, f), join(evDir, f));
+    }
+    // 2.4.0: ReactorBlockTruePositive is all warnings (thread unknown) and the text report
+    // prints evidence only under criticals, so a reactor-block critical is added here: a
+    // .block() in a Reactor operator callback.
+    writeFileSync(join(evDir, 'ReactorBlockOperatorProbe.java'), [
+      'import reactor.core.publisher.Mono;', '@org.springframework.stereotype.Service', 'public class ReactorBlockOperatorProbe {',
+      '    public Mono<String> a(Mono<String> m) {', '        return m.map(x -> Mono.just(x).block());', '    }', '}', ''].join('\n'));
+    const text = run(['--no-color', evDir]).stdout;
+    assert(!/Lab #0?4|Lab #0?8 — Kafka Streams\s*$|pool exhausted|throughput -74%|p99 \+18\.2s/m.test(text.split('kafka-send-timeout')[0] ?? text),
+      'no retracted / other-mechanism figures (Lab #04 pool metrics, Lab #08 under blocking-kafka) are printed');
+    const evidenceAfter = (needle) => text.split('\n')[text.split('\n').findIndex(l => l.includes(needle)) + 1] ?? '';
+    // blocking: measured for @Async (verify/blocking, pre-registered, results pinned to c4e5ddd);
+    // @Scheduled / @EventListener stay "documented mechanism".
+    const linesAfter = (needle, n) => { const ls = text.split('\n'); const i = ls.findIndex(l => l.includes(needle)); return ls.slice(i + 1, i + 1 + n).join('\n'); };
+    const blockingEvidence = linesAfter('detected in @Scheduled method → BlockingTruePositive', 3);
+    assert(blockingEvidence.includes("Evidence (measured, java-vibe-guard verify/blocking — @Async): on Spring Boot's default @Async executor"), 'blocking: measured evidence for @Async');
+    assert(/Source: https:\/\/github\.com\/Joaquinriosheredia\/java-vibe-guard\/blob\/c4e5ddd\/cli\/verify\/blocking\/results\/criteria\.md#L7-L38/.test(blockingEvidence), 'blocking: source pinned to the results commit');
+    assert(blockingEvidence.includes('Evidence (@Scheduled, @EventListener): documented mechanism, no benchmark of our own'), 'blocking: @Scheduled/@EventListener stay documented mechanism');
+    // blocking-kafka: measured (verify/blocking-kafka, pre-registered, results pinned to a6f32ef).
+    const bkEvidence = linesAfter('detected in @KafkaListener', 2);
+    assert(bkEvidence.includes('Evidence (measured, java-vibe-guard verify/blocking-kafka — @KafkaListener): the damage appears only when max.poll.records x time per record > max.poll.interval.ms'), 'blocking-kafka: measured evidence, threshold in general form');
+    assert(/Source: https:\/\/github\.com\/Joaquinriosheredia\/java-vibe-guard\/blob\/a6f32ef\/cli\/verify\/blocking-kafka\/results\/criteria\.md#L7-L47/.test(bkEvidence), 'blocking-kafka: source pinned to the results commit');
+    // reactor-block: measured for Schedulers.parallel() (verify/reactor-block, results pinned to c934bd7);
+    // the event loop and .toFuture().get() stay documented mechanism.
+    const rbEvidence = linesAfter('Reactive blocking call', 6);
+    assert(rbEvidence.includes('Evidence (measured, java-vibe-guard verify/reactor-block — .block() on Schedulers.parallel()): a .block() on a Schedulers.parallel() worker'), 'reactor-block: measured evidence for parallel workers');
+    assert(/Source: https:\/\/github\.com\/Joaquinriosheredia\/java-vibe-guard\/blob\/c934bd7\/cli\/verify\/reactor-block\/results\/criteria\.md#L32-L46/.test(rbEvidence), 'reactor-block: source pinned to the results commit');
+    assert(rbEvidence.includes('Evidence (measured, java-vibe-guard verify/reactor-block replication — .block() on the Netty event loop): a .block() on the Netty event loop'), 'reactor-block: measured evidence for the event loop');
+    assert(/Source: https:\/\/github\.com\/Joaquinriosheredia\/java-vibe-guard\/blob\/1052498\/cli\/verify\/reactor-block\/replication\/results\/criteria\.md#L15-L25/.test(rbEvidence), 'reactor-block: event-loop source pinned to the replication results');
+    assert(rbEvidence.includes('Evidence (measured, java-vibe-guard verify/reactor-block replication — .toFuture().get() on the Netty event loop): a .toFuture().get() in a WebFlux handler'), 'reactor-block: measured evidence for .toFuture().get()');
+    assert(!rbEvidence.includes('documented mechanism'), 'reactor-block: no documented-mechanism line left');
+    const sources = text.split('\n').filter(l => l.trim().startsWith('Source: '));
+    assert(sources.some(l => /Java-Production-Labs\/blob\/727f42c\/05_saga_pattern\/benchmark\/results\/summary\.md#L53-L67/.test(l)), 'kafka-send-timeout cites Lab 05 results pinned to the result commit');
+    assert(sources.some(l => /Java-Production-Labs\/blob\/3e60592\/08_kafka_streams\/benchmark\/results\/summary\.md#L64-L86/.test(l)), 'kafka-send-timeout cites Lab 08 results pinned to the result commit');
+  } finally {
+    rmSync(evDir, { recursive: true, force: true });
+  }
+
+  // The two A3.x window probes are scoped to blocking-kafka: no rule may fire.
+  for (const probe of ['BlockingWindowCommentProbe.java', 'BlockingWindowMisattributionProbe.java']) {
+    const probeDir = mkdtempSync(join(tmpdir(), 'vibe-guard-fixture-'));
+    try {
+      copyFileSync(join(FIXTURES, probe), join(probeDir, probe));
+      const all = JSON.parse(run(['--json', probeDir]).stdout);
+      assert(all.issues.length === 0, `${probe}: 0 findings from ANY rule: got ${all.issues.map(i => i.ruleId).join(',') || 'none'}`);
+    } finally {
+      rmSync(probeDir, { recursive: true, force: true });
+    }
+  }
+
+  // Unit level: only the reactive .block* message is shadowed, never other calls.
+  const loc = 'Svc.java:10';
+  const kept = dropFindingsShadowedByReactorBlock([
+    { rule: 'reactor-block', severity: 'critical', location: loc, message: "Reactive blocking call '.block()' inside Spring bean" },
+    { rule: 'blocking', location: loc, message: 'blocking .block() detected in @Async method' },
+    { rule: 'blocking', location: loc, message: 'Thread.sleep() detected in @Async method' },
+    { rule: 'blocking', location: 'Svc.java:11', message: 'blocking .block() detected in @Async method' },
+  ]);
+  assert(kept.length === 3, `dedup drops only the shadowed .block() finding: kept ${kept.length}`);
+  assert(!kept.some(f => f.location === loc && f.message.startsWith('blocking .block()')), 'shadowed .block() on the reactor-block line is gone');
+  assert(kept.some(f => f.message.startsWith('Thread.sleep()')), 'Thread.sleep() on the same line is kept');
+  assert(kept.some(f => f.location === 'Svc.java:11'), '.block() on a line without reactor-block is kept');
+  // 2.4.0: a reactor-block WARNING never shadows blocking; it is the one dropped.
+  const keptW = dropFindingsShadowedByReactorBlock([
+    { rule: 'reactor-block', severity: 'warning', location: loc, message: "Blocking call '.block()' in a Spring bean" },
+    { rule: 'blocking', severity: 'critical', location: loc, message: 'blocking .block() detected in @Scheduled method' },
+    { rule: 'reactor-block', severity: 'warning', location: 'Svc.java:12', message: "Blocking call '.block()' in a Spring bean" },
+  ]);
+  assert(keptW.length === 2 && keptW.some(f => f.rule === 'blocking' && f.location === loc), 'reactor-block warning + blocking on one line: blocking kept, the warning dropped');
+  assert(keptW.some(f => f.rule === 'reactor-block' && f.location === 'Svc.java:12'), 'a reactor-block warning with no blocking finding on its line is kept');
+}
+
 // ─── Test 19: zero regression on test-fixtures/ (no vibeguard.config.json) ─
 console.log('\n📋 Test 19: zero regression on test-fixtures/ with no config file present');
 {
   const { stdout, exitCode } = run(['--json', FIXTURES]);
   const json = JSON.parse(stdout);
 
-  assert(json.summary.critical === 14, 'summary.critical is 14 (was 11: +2 BlockingAsyncEventListenerTruePositive.java @Async/@EventListener + 1 BlockingWindowMisattributionProbe.java A3.2 known-limitation finding — see issue #11 / A3.1)');
-  assert(json.summary.major === 1, 'summary.major unchanged at 1');
-  assert(json.summary.warning === 8, 'summary.warning is 8 (was 5: +3 "kafka" rule missing-@RetryableTopic/DLQ warnings — incidental, from the 3 real @KafkaListener methods across the new A3.1 fixtures, not part of what A3.1 tests)');
-  assert(json.summary.reported === 23 && json.summary.total === 23, 'reported === total === 23 (was 17 before the A3.1 fixtures were added: +3 critical +3 warning)');
+  // Per-fixture, per-rule, per-severity accounting lives in fixture-ledger.js
+  // (history: 28 after A3.2 — see that file and issue #11; 30 after 0a: +4
+  // BlockingFutureGetTruePositive.java, +2 ReactorBlockAsyncDuplicateProbe.java,
+  // -3 kafka warnings on the window probes (@RetryableTopic), -1 merged
+  // double-anchor finding).
+  const EXPECTED = ledgerTotals();
+  const ledgerDiff = diffAgainstLedger(breakdownFromJson(json));
+  assert(ledgerDiff.length === 0, `findings match fixture-ledger.js exactly${ledgerDiff.length ? ':\n    ' + ledgerDiff.join('\n    ') : ''}`);
+  assert(json.summary.critical === EXPECTED.critical, `summary.critical is ${EXPECTED.critical}: got ${json.summary.critical}`);
+  assert(json.summary.major === EXPECTED.major, `summary.major is ${EXPECTED.major}: got ${json.summary.major}`);
+  assert(json.summary.warning === EXPECTED.warning, `summary.warning is ${EXPECTED.warning}: got ${json.summary.warning}`);
+  assert(json.summary.reported === EXPECTED.total && json.summary.total === EXPECTED.total, `reported === total === ${EXPECTED.total}`);
   assert(json.summary.suppressed === 0, 'suppressed is 0 — no config file, no directives');
   assert(exitCode === 1, 'exit code is 1, unchanged — real criticals still fail the build');
+}
+
+// ─── Test 19b (2.3.0): opt-in rules are outside the default set ──────────────
+console.log('\n📋 Test 19b: opt-in rules (observability, async-returns-pending-future) run only with --rule');
+{
+  assert(RULES.filter(r => r.optIn).map(r => r.id).sort().join(',') === 'async-returns-pending-future,observability',
+    'the opt-in rules are async-returns-pending-future (2.3.0) and observability (2.4.0)');
+  assert(Object.keys(OPT_IN_LEDGER).sort().join(',') === 'async-returns-pending-future,observability',
+    'OPT_IN_LEDGER lists exactly the opt-in rules');
+  const all = JSON.parse(run(['--json', FIXTURES]).stdout);
+  assert(!all.issues.some(i => i.ruleId === 'async-returns-pending-future'), 'default scan: no async-returns-pending-future finding');
+  assert(!all.issues.some(i => i.ruleId === 'observability'), 'default scan: no observability finding');
+  assert(/^OPT-IN: runs only with --rule observability/.test(RULE_CATALOG.observability.full),
+    '--explain observability says opt-in');
+  for (const [rule, ledger] of Object.entries(OPT_IN_LEDGER)) {
+    const json = JSON.parse(run(['--json', '--rule', rule, FIXTURES]).stdout);
+    const diff = diffAgainstLedger(breakdownFromJson(json), ledger);
+    assert(diff.length === 0, `--rule ${rule} on test-fixtures/ matches OPT_IN_LEDGER${diff.length ? ':\n    ' + diff.join('\n    ') : ''}`);
+  }
+  assert(/^OPT-IN: runs only with --rule async-returns-pending-future/.test(RULE_CATALOG['async-returns-pending-future'].full)
+    && RULE_CATALOG['async-returns-pending-future'].full.includes('3/7 true positives (43 %, Wilson 95 % CI 16-75 %) in a pre-registered corpus of 50 repositories; n too small'),
+    '--explain says opt-in and that precision is not conclusively measured (3/7, 16-75 %)');
+}
+
+// ─── Test 19c (2.3.0): @EnableAsync in the scanned tree ──────────────────────
+// Without @EnableAsync / <task:annotation-driven/> Spring registers no async interceptor:
+// @Async is inert. blocking (its @Async anchor) and async-returns-pending-future report
+// nothing then. Post hoc, after the b0-corpus audit (4 FPs, OsmAnd-tools, no @EnableAsync).
+console.log('\n📋 Test 19c: @Async counts only with @EnableAsync in the scanned tree');
+{
+  const EA = join(FIXTURES, 'enable-async');
+  const scanWith = (extra) => {
+    const dir = mkdtempSync(join(tmpdir(), 'vibe-guard-enable-async-'));
+    try {
+      copyFileSync(join(EA, 'AsyncWork.java'), join(dir, 'AsyncWork.java'));
+      for (const f of extra) cpSync(join(EA, f), join(dir, f.split('/').pop()));
+      const one = rule => JSON.parse(run(['--json', '--rule', rule, dir]).stdout).issues;
+      return { blocking: one('blocking'), apf: one('async-returns-pending-future') };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const none = scanWith([]);
+  assert(none.blocking.length === 0, 'no @EnableAsync: blocking reports no @Async finding');
+  assert(none.apf.length === 0, 'no @EnableAsync: async-returns-pending-future reports nothing');
+  const decoys = scanWith(['decoys/NotEnableAsync.java', 'decoys/mvc-annotation-driven.xml']);
+  assert(decoys.blocking.length === 0 && decoys.apf.length === 0,
+    'decoys (comment, string, another library\'s @EnableAsync, mvc/tx annotation-driven): still nothing');
+  for (const cfg of ['config/SpringEnableAsync.java', 'config/QualifiedEnableAsync.java', 'config/task-annotation-driven.xml']) {
+    const r = scanWith([cfg]);
+    assert(r.blocking.length === 1 && r.blocking[0].location === 'AsyncWork.java:16' && r.blocking[0].message === 'blocking .join() detected in @Async method',
+      `${cfg}: blocking reports the @Async .join()`);
+    assert(r.apf.length === 1 && r.apf[0].location === 'AsyncWork.java:21' && r.apf[0].severity === 'critical',
+      `${cfg}: async-returns-pending-future reports the M1 return`);
+  }
+  // @Scheduled / @EventListener / @KafkaListener do not depend on @EnableAsync.
+  const sched = runOnFixture('BlockingDoubleAnchorProbe.java', 'blocking');
+  assert(sched.issues.length === 1 && sched.issues[0].message === 'Thread.sleep() detected in @Scheduled method',
+    'no @EnableAsync: the @Scheduled anchor of an @Async + @Scheduled method still reports, naming @Scheduled only');
+  const kafka = runOnFixture('KafkaBlockingProbe.java', 'blocking-kafka');
+  assert(kafka.issues.length === 1, 'no @EnableAsync: blocking-kafka unchanged');
+}
+
+// ─── Test 20: blocking → WARNING with virtual threads (Phase 2, 2026-10-04) ───
+// Conservative: WARNING only for an @Async-only call when the module's base
+// application.properties / application.yml sets spring.threads.virtual.enabled=true and
+// nothing else sets it otherwise. Each module fixture is scanned on its own.
+console.log('\n📋 Test 20: blocking → WARNING only with virtual threads enabled in the base config');
+{
+  const VT = join(FIXTURES, 'virtual-threads');
+  const scan = (module) => JSON.parse(run(['--json', '--rule', 'blocking', join(VT, module)]).stdout).issues;
+  const asyncFinding = (issues) => issues.find(i => i.location === 'src/main/java/demo/AsyncService.java:9');
+
+  for (const [module, file] of [['base-enabled', 'application.properties'], ['base-enabled-yml', 'application.yml']]) {
+    const f = asyncFinding(scan(module));
+    assert(f?.severity === 'warning', `${module}: @Async .join() is WARNING`);
+    assert(f?.message.includes(`WARNING, not CRITICAL: spring.threads.virtual.enabled=true in src/main/resources/${file}`), `${module}: the message says why (key and file)`);
+    assert(f?.message.includes('with virtual threads enabled the default @Async executor did not saturate (measured, verify/blocking variant D: '
+      + 'https://github.com/Joaquinriosheredia/java-vibe-guard/blob/c4e5ddd/cli/verify/blocking/results/criteria.md#L38-L38)'), `${module}: the message cites variant D, pinned`);
+  }
+  for (const module of ['profile-only', 'profile-document', 'disabled', 'absent', 'base-enabled-profile-disabled', 'placeholder']) {
+    const f = asyncFinding(scan(module));
+    assert(f?.severity === 'critical' && f.message === 'blocking .join() detected in @Async method', `${module}: stays CRITICAL with the unchanged message`);
+  }
+
+  const enabled = scan('base-enabled');
+  const job = enabled.filter(i => i.location.startsWith('src/main/java/demo/ScheduledJob.java'));
+  assert(job.length === 2 && job.every(i => i.severity === 'critical'), 'base-enabled: @Scheduled and @Async + @Scheduled stay CRITICAL (not measured)');
+  const kafka = JSON.parse(run(['--json', '--rule', 'blocking-kafka', join(VT, 'base-enabled')]).stdout).issues;
+  assert(kafka.length === 1 && kafka[0].severity === 'critical', 'base-enabled: blocking-kafka stays CRITICAL');
+
+  // A WARNING alone does not fail the build; the file outside a module stays CRITICAL.
+  const onlyWarning = mkdtempSync(join(tmpdir(), 'vibe-guard-vt-'));
+  try {
+    cpSync(join(VT, 'base-enabled'), onlyWarning, { recursive: true });
+    rmSync(join(onlyWarning, 'src/main/java/demo/ScheduledJob.java'));
+    const r = run(['--json', onlyWarning]);
+    assert(r.exitCode === 0 && JSON.parse(r.stdout).summary.warning === 1, 'a module whose only blocking finding is the WARNING exits 0');
+    rmSync(join(onlyWarning, 'pom.xml'));
+    const noModule = JSON.parse(run(['--json', '--rule', 'blocking', onlyWarning]).stdout).issues;
+    assert(noModule.length === 1 && noModule[0].severity === 'critical', 'no module root (no pom.xml / build.gradle): stays CRITICAL');
+  } finally {
+    rmSync(onlyWarning, { recursive: true, force: true });
+  }
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────

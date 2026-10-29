@@ -1,16 +1,43 @@
 import { stripComments } from './strip-comments.js';
+import { extractMethodBodyRange } from './method-body.js';
+import { relative } from 'path';
+import { virtualThreadsEnabled, VT_KEY } from './virtual-threads.js';
+import { asyncEnabledInScan } from './enable-async.js';
+
+// Measured evidence for the WARNING downgrade: verify/blocking variant D (virtual
+// threads enabled) did not saturate the default @Async executor.
+const VARIANT_D_SOURCE = 'https://github.com/Joaquinriosheredia/java-vibe-guard/blob/c4e5ddd/cli/verify/blocking/results/criteria.md#L38-L38';
 
 const ASYNC_ANNOTATIONS = [
-  { re: /@Scheduled\b/,    name: '@Scheduled' },
+  { re: /@(?:org\.springframework\.scheduling\.annotation\.)?Scheduled\b/, name: '@Scheduled', springScheduled: true },
   { re: /@KafkaListener\b/, name: '@KafkaListener' },
-  { re: /@Async\b/,        name: '@Async' },
+  { re: /@(?:org\.springframework\.scheduling\.annotation\.)?Async\b/, name: '@Async', spring: true },
   { re: /@EventListener\b/, name: '@EventListener' },
 ];
 
-// Future.get()/CompletableFuture.get() are intentionally NOT detected —
-// distinguishing a blocking Future.get() from a non-blocking Optional.get()/
-// Map.get()/etc. requires receiver type resolution, which this regex-based
-// engine doesn't have. See issue #5 and the pending CLI/MCP architecture ADR.
+// @Async counts only when it is Spring's (the measured executor is Spring's): a
+// fully qualified annotation, or a simple `@Async` in a file that imports
+// org.springframework.scheduling.annotation.Async (or .*). jcabi-aspects' @Async
+// (eugenp/tutorials libraries-6 JcabiAspectJ.java) runs on its own executor.
+const SPRING_ASYNC_IMPORT_RE = /^\s*import\s+org\.springframework\.scheduling\.annotation\.(?:Async|\*)\s*;/;
+const SPRING_ASYNC_QUALIFIED_RE = /@org\.springframework\.scheduling\.annotation\.Async\b/;
+// @Scheduled counts only when it is Spring's too, by the same import/qualified test.
+// Quarkus' io.quarkus.scheduler.Scheduled runs blocking methods on a worker pool and does
+// not hold Spring's scheduler thread (test-corpus-2 FP-ANALYSIS.md: J015-J018, quarkusio).
+const SPRING_SCHEDULED_IMPORT_RE = /^\s*import\s+org\.springframework\.scheduling\.annotation\.(?:Scheduled|\*)\s*;/;
+const SPRING_SCHEDULED_QUALIFIED_RE = /@org\.springframework\.scheduling\.annotation\.Scheduled\b/;
+// A synchronous @EventListener of an event Spring Boot publishes once at start-up blocks
+// only the start-up thread (test-corpus-2 J053: ApplicationStartedEvent): WARNING, with
+// the reason in the message. Recognised in the annotation's arguments or the signature.
+const STARTUP_EVENT_RE = /\b(ApplicationStartingEvent|ApplicationEnvironmentPreparedEvent|ApplicationContextInitializedEvent|ApplicationPreparedEvent|ApplicationStartedEvent|ApplicationReadyEvent|ContextRefreshedEvent|(?:Servlet|Reactive)?WebServerInitializedEvent)\b/;
+// And only when the scanned tree has @EnableAsync (enable-async.js): without it @Async
+// runs inline on the caller's thread, not on the measured executor (2026-10-12, after the
+// b0-corpus audit). @Scheduled, @EventListener and @KafkaListener are unaffected.
+
+// A bare `.get()` is NOT a pattern here — it can't tell a blocking
+// Future.get() from Optional.get()/Map.get() without type resolution (issue
+// #5). Future.get() is instead matched per receiver name, only for names this
+// same file declares with a Future type — see futureReceiverNames() below.
 const BLOCKING_PATTERNS = [
   { re: /\.\s*join\s*\(\s*\)/,          name: 'blocking .join()' },
   { re: /\.\s*block\s*\(\s*\)/,         name: 'blocking .block()' },
@@ -19,58 +46,109 @@ const BLOCKING_PATTERNS = [
   { re: /Thread\s*\.\s*sleep\s*\(/,     name: 'Thread.sleep()' },
 ];
 
+// A field, parameter or local declared with one of these types, e.g.
+//   CompletableFuture<Order> future = ...      Future<?> f,      Future pending;
+// (raw or generic, optionally fully qualified). The declared name is what
+// `.get()` must be called on to count as a blocking Future.get().
+const FUTURE_DECLARATION_RE =
+  /\b(?:java\.util\.concurrent\.)?(?:Completable|Listenable|Scheduled|Runnable)?Future(?:Task)?\b\s*(?:<(?:[^<>;=(){}]|<(?:[^<>;=(){}]|<[^<>;=(){}]*>)*>)*>)?\s+([A-Za-z_$][\w$]*)\s*[=;,)]/g;
+// `var name = CompletableFuture.supplyAsync(...)` etc. — inferred type, but
+// unambiguous from the factory call.
+const FUTURE_VAR_RE = /\bvar\s+([A-Za-z_$][\w$]*)\s*=\s*CompletableFuture\s*\./g;
+// `CompletableFuture.supplyAsync(...).get()` chained on one line, no receiver name.
+const CHAINED_FUTURE_GET_RE = /\bCompletableFuture\s*\.\s*\w+\s*\(.*\)\s*\.\s*get\s*\(\s*\)/;
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Names declared anywhere in the file with a Future type. File-wide (not just
+// the annotated method) so fields and constructor-injected futures count too.
+// Only the untimed `.get()` is matched: `.get(timeout, unit)` is bounded and
+// is what the rule's own fix advice points to (same split as
+// kafka-send-timeout).
+export function futureReceiverNames(lines) {
+  const names = new Set();
+  for (const line of lines) {
+    const code = stripComments(line);
+    for (const re of [FUTURE_DECLARATION_RE, FUTURE_VAR_RE]) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(code)) !== null) names.add(m[1]);
+    }
+  }
+  return names;
+}
+
+function futureGetPatterns(lines) {
+  const patterns = [...futureReceiverNames(lines)].map(name => ({
+    re: new RegExp(`(?<![\\w$.])${escapeRegExp(name)}\\s*\\.\\s*get\\s*\\(\\s*\\)`),
+    name: 'blocking Future.get()',
+  }));
+  patterns.push({ re: CHAINED_FUTURE_GET_RE, name: 'blocking Future.get()' });
+  return patterns;
+}
+
 export function checkBlocking(fileContexts) {
   const findings = [];
+  let asyncEnabled;   // computed once, on the first Spring @Async anchor
 
   for (const { filePath, lines, relativePath } of fileContexts) {
     if (!filePath.endsWith('.java')) continue;
 
     // Collect positions of async annotations
     const annotatedPositions = [];
+    const springAsyncImported = lines.some(line => SPRING_ASYNC_IMPORT_RE.test(stripComments(line)));
+    const springScheduledImported = lines.some(line => SPRING_SCHEDULED_IMPORT_RE.test(stripComments(line)));
     for (let i = 0; i < lines.length; i++) {
       // Issue #9: strip comments before the anchor test — a comment merely
       // mentioning "@Scheduled"/"@KafkaListener"/etc. (e.g. explaining what a
       // fixture does NOT contain) must not open a detection window.
       const code = stripComments(lines[i]);
-      for (const { re, name } of ASYNC_ANNOTATIONS) {
+      for (const { re, name, spring, springScheduled } of ASYNC_ANNOTATIONS) {
         if (re.test(code)) {
-          annotatedPositions.push({ lineIdx: i, annotationName: name });
+          if (spring && !springAsyncImported && !SPRING_ASYNC_QUALIFIED_RE.test(code)) continue;
+          if (spring && !(asyncEnabled ??= asyncEnabledInScan(fileContexts))) continue;
+          if (springScheduled && !springScheduledImported && !SPRING_SCHEDULED_QUALIFIED_RE.test(code)) continue;
+          const startupEvent = name === '@EventListener' ? startupEventOf(lines, i) : null;
+          annotatedPositions.push({ lineIdx: i, annotationName: name, startupEvent });
           break;
         }
       }
     }
     if (annotatedPositions.length === 0) continue;
 
-    for (const { lineIdx, annotationName } of annotatedPositions) {
-      const windowEnd = Math.min(lineIdx + 60, lines.length);
-      for (let i = lineIdx + 1; i < windowEnd; i++) {
-        const trimmed = lines[i].trim();
-        if (trimmed.startsWith('//') || trimmed.startsWith('*')) continue;
-        // Stop if we hit another top-level annotation (new method boundary)
-        if (i > lineIdx + 3 && trimmed.startsWith('@') && ASYNC_ANNOTATIONS.some(a => a.re.test(trimmed))) break;
+    const patterns = [...BLOCKING_PATTERNS, ...futureGetPatterns(lines)];
 
-        // Issue #11 / A3.1: strip comments before the BLOCKING_PATTERNS test —
-        // same fix as the anchor test above (issue #9), applied to the site
-        // that was explicitly left out of scope back then. The
-        // trimmed.startsWith('//')/('*') skip a few lines up only catches a
-        // comment that is the ENTIRE line; it doesn't catch a trailing "//"
-        // comment after real code, or a single-line "/* ... */" comment not
-        // prefixed with "*". stripComments() (already used for the anchor
-        // test) closes both gaps here too.
-        //
-        // NOT fixed by this change (A3.2, still open): the window itself does
-        // not track real method boundaries — a blocking call in a subsequent,
-        // unannotated method within the same 60-line window is still
-        // misattributed to this annotation. See
-        // BlockingWindowMisattributionProbe.java in the test fixtures.
+    for (const { lineIdx, annotationName, startupEvent } of annotatedPositions) {
+      // A3.2 (issue #11): the fixed 60-line window used to scan past the
+      // annotated method's real closing brace into whatever came next,
+      // misattributing a blocking call in a later, unannotated method to
+      // this annotation (see BlockingWindowMisattributionProbe.java's
+      // history). extractMethodBodyRange() replaces it with the method's
+      // real structural boundary — the "stop at the next annotation"
+      // heuristic this loop used to rely on as a partial mitigation is gone,
+      // superseded by the real boundary. The 60-line cap is still passed
+      // through, but now only as a safety bound on how far the boundary
+      // search itself goes (see method-body.js), not as the attribution
+      // limit.
+      const range = extractMethodBodyRange(lines, lineIdx, 60);
+      if (range === null) continue; // abstract/interface method — no body to scan
+
+      for (let i = range.startLineIdx + 1; i <= range.endLineIdx; i++) {
+        // Issue #11 / A3.1: strip comments before the BLOCKING_PATTERNS test
+        // — a comment merely mentioning a blocking call name inside an
+        // otherwise-safe method must not fire. Unchanged by A3.2.
         const windowCode = stripComments(lines[i]);
-        for (const { re, name } of BLOCKING_PATTERNS) {
+        for (const { re, name } of patterns) {
           if (re.test(windowCode)) {
             findings.push({
-              severity: 'critical',
               rule: annotationName === '@KafkaListener' ? 'blocking-kafka' : 'blocking',
-              message: `${name} detected in ${annotationName} method`,
+              call: name,
+              annotationName,
+              startupEvent,
               location: `${relativePath}:${i + 1}`,
+              filePath,
             });
           }
         }
@@ -78,15 +156,71 @@ export function checkBlocking(fileContexts) {
     }
   }
 
-  return deduplicate(findings);
+  return mergeByCall(findings);
 }
 
-function deduplicate(findings) {
-  const seen = new Set();
-  return findings.filter(f => {
-    const key = `${f.location}|${f.message}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+// The start-up event an @EventListener at lines[idx] listens to, from the annotation's
+// arguments or the method signature (up to its opening brace), or null.
+function startupEventOf(lines, idx) {
+  const header = [];
+  for (let k = idx; k < lines.length && k - idx < 10; k++) {
+    const code = stripComments(lines[k]);
+    header.push(code);
+    if (code.includes('{')) break;
+  }
+  return STARTUP_EVENT_RE.exec(header.join(' '))?.[1] ?? null;
+}
+
+// One finding per (location, rule, call). A method with several anchors
+// (e.g. @Async + @Scheduled stacked, BlockingDoubleAnchorProbe.java) used to
+// get one finding per anchor for the SAME call — two findings for one
+// Thread.sleep(). They are merged and every anchor is named in the message.
+// The call stays in the key so two different blocking calls on one line are
+// still two findings. Single-anchor messages keep their exact pre-2.0 text,
+// so existing vibeguard-baseline.json buckets (keyed on the message) still match.
+//
+// Severity: CRITICAL, except a `blocking` finding whose only anchor is @Async in a
+// module whose base configuration enables virtual threads (virtual-threads.js):
+// WARNING, with the reason and the measured evidence in the message. @Scheduled
+// and @EventListener were not measured, so a call under them stays CRITICAL even
+// when @Async is also present.
+function mergeByCall(rawFindings) {
+  const merged = new Map();
+  for (const f of rawFindings) {
+    const key = `${f.location}|${f.rule}|${f.call}`;
+    const entry = merged.get(key);
+    if (!entry) {
+      merged.set(key, { ...f, annotations: [f.annotationName], startupEvents: [f.startupEvent] });
+    } else if (!entry.annotations.includes(f.annotationName)) {
+      entry.annotations.push(f.annotationName);
+      entry.startupEvents.push(f.startupEvent);
+    }
+  }
+  return [...merged.values()].map(({ rule, call, annotations, startupEvents, location, filePath }) => {
+    const message = annotations.length === 1
+      ? `${call} detected in ${annotations[0]} method`
+      : `${call} detected in method annotated ${annotations.join(', ')}`;
+    // Only a lone synchronous @EventListener: with @Async or @Scheduled stacked, the call
+    // also runs on that pool.
+    if (annotations.length === 1 && annotations[0] === '@EventListener' && startupEvents[0]) {
+      return {
+        severity: 'warning',
+        rule,
+        message: `${message} — WARNING, not CRITICAL: a synchronous listener of ${startupEvents[0]}, `
+          + 'which Spring Boot publishes once at start-up, so it blocks only the start-up thread',
+        location,
+      };
+    }
+    const vt = rule === 'blocking' && annotations.length === 1 && annotations[0] === '@Async'
+      ? virtualThreadsEnabled(filePath)
+      : { enabled: false };
+    if (!vt.enabled) return { severity: 'critical', rule, message, location };
+    return {
+      severity: 'warning',
+      rule,
+      message: `${message} — WARNING, not CRITICAL: ${VT_KEY}=true in ${relative(vt.root, vt.file)}, and with virtual threads `
+        + `enabled the default @Async executor did not saturate (measured, verify/blocking variant D: ${VARIANT_D_SOURCE})`,
+      location,
+    };
   });
 }

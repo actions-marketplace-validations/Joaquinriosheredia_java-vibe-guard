@@ -61,7 +61,7 @@ function assertFieldOrder(stdout, fields, label) {
   assert(inOrder, label);
 }
 
-const EIGHT_RULE_IDS = ['blocking', 'blocking-kafka', 'kafka', 'kafka-send-timeout', 'layers', 'observability', 'reactor-block', 'transactions'];
+const EIGHT_RULE_IDS = ['blocking', 'blocking-kafka', 'kafka', 'kafka-send-timeout', 'layers', 'observability', 'reactor-block', 'async-returns-pending-future', 'transactions'];
 const AVAILABLE_LIST = EIGHT_RULE_IDS.join(', ');
 
 // ─── §1: Purpose — no project scan, no path argument ─────────────────────────
@@ -79,30 +79,33 @@ console.log('\n📋 §2: Data source — rule-catalog.js content and corrected c
   assert(typeof RULE_CATALOG === 'object' && RULE_CATALOG !== null, 'RULE_CATALOG is exported as an object');
 
   const kafka = RULE_CATALOG.kafka;
+  // kafka.short / transactions.short were deliberately rewritten after the
+  // extraction from sarif.js to match what the detectors actually do
+  // (50a7d6d kafka scope, c47509c transactions); pinned to the current text.
   assert(
-    kafka?.short === 'Kafka configuration and listener anti-patterns.',
-    'kafka.short matches the exact text that used to live in sarif.js:50 verbatim'
+    kafka?.short === 'Kafka listener, consumer group, and Zookeeper configuration issues.',
+    'kafka.short matches the current catalog text (50a7d6d)'
   );
   assert(
     kafka?.full === 'Flags Kafka usage issues: Zookeeper-based configuration deprecated in Kafka 3.x, @KafkaListener without an explicit groupId, listeners without retry/DLQ handling, and consumer configuration missing group.id.',
-    'kafka.full matches the exact text that used to live in sarif.js:51 verbatim'
+    'kafka.full matches the exact text that used to live in sarif.js:51 verbatim (unchanged)'
   );
 
   const transactions = RULE_CATALOG.transactions;
   assert(
-    transactions?.short === 'Transactional-boundary and rollback anti-patterns.',
-    'transactions.short matches the exact text that used to live in sarif.js:62 verbatim'
+    transactions?.short === '@Transactional placed on a Controller method, or combined with @Async.',
+    'transactions.short matches the current catalog text (c47509c)'
   );
 
   // severities field — new in this extraction, per docs/explain.md §2.
   assert(Array.isArray(RULE_CATALOG.blocking?.severities), 'blocking.severities is an array');
-  assert(RULE_CATALOG.blocking.severities.join(',') === 'critical', 'blocking: single severity, critical');
+  assert(RULE_CATALOG.blocking.severities.join(',') === 'critical,warning', 'blocking: critical, and warning for @Async with virtual threads enabled in the base config');
   assert(RULE_CATALOG['blocking-kafka'].severities.join(',') === 'critical', 'blocking-kafka: single severity, critical');
   assert(RULE_CATALOG.kafka.severities.join(',') === 'warning', 'kafka: single severity, warning');
   assert(RULE_CATALOG['kafka-send-timeout'].severities.join(',') === 'critical', 'kafka-send-timeout: single severity, critical');
   assert(RULE_CATALOG.layers.severities.join(',') === 'major', 'layers: single severity, major');
   assert(RULE_CATALOG.observability.severities.join(',') === 'warning', 'observability: single severity, warning');
-  assert(RULE_CATALOG['reactor-block'].severities.join(',') === 'critical', 'reactor-block: single severity, critical');
+  assert(RULE_CATALOG['reactor-block'].severities.join(',') === 'critical,warning', 'reactor-block: critical (evidence of a Reactor thread) or warning (thread unknown), 2.4.0');
   assert(
     RULE_CATALOG.transactions.severities.join(',') === 'critical,major',
     'transactions: mixed severity, highest-first (critical, major) — matches transactions.js:21/33 evidence'
@@ -175,7 +178,7 @@ console.log('\n📋 §4: Output format — rule id, Severity line, short, full, 
     [
       'kafka',
       'Severity: warning',
-      'Kafka configuration and listener anti-patterns.',
+      RULE_CATALOG.kafka.short,
       'Flags Kafka usage issues:',
     ],
     'kafka: rule id, Severity, short, full appear in this exact order'
@@ -193,8 +196,8 @@ console.log('\n📋 §4: Output format — rule id, Severity line, short, full, 
     [
       'transactions',
       expectedMixedSeverityLine,
-      'Transactional-boundary and rollback anti-patterns.',
-      'Detects @Transactional methods',
+      RULE_CATALOG.transactions.short,
+      'Detects two @Transactional misuses',
     ],
     'transactions: rule id, Severity (mixed), short, full appear in this exact order'
   );
